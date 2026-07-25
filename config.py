@@ -46,3 +46,46 @@ def get_llm(temperature: float = 0):
         "No LLM backend configured. Set one of OLLAMA_MODEL, OPENAI_API_KEY, "
         "or GEMINI_API_KEY in .env."
     )
+
+
+def get_embeddings():
+    """Return an embeddings model, picked by the same provider priority as get_llm().
+
+    1. Ollama — used when OLLAMA_MODEL is set. Embeds with OLLAMA_EMBED_MODEL
+       (defaults to embeddinggemma:latest), served by the same Ollama instance.
+    2. OpenAI — used when OPENAI_API_KEY is set. Embeds with OPENAI_EMBED_MODEL
+       (defaults to text-embedding-3-small).
+    3. Gemini — used when GEMINI_API_KEY is set. Embeds with GEMINI_EMBED_MODEL
+       (defaults to models/text-embedding-004).
+    """
+    ollama_model = os.getenv("OLLAMA_MODEL")
+    if ollama_model:
+        from langchain_ollama import OllamaEmbeddings
+
+        return OllamaEmbeddings(
+            model=os.getenv("OLLAMA_EMBED_MODEL", "embeddinggemma:latest"),
+            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        )
+
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if openai_api_key:
+        from langchain_openai import OpenAIEmbeddings
+
+        return OpenAIEmbeddings(
+            model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
+            api_key=openai_api_key,
+        )
+
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if gemini_api_key:
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+        return GoogleGenerativeAIEmbeddings(
+            model=os.getenv("GEMINI_EMBED_MODEL", "models/text-embedding-004"),
+            google_api_key=gemini_api_key,
+        )
+
+    raise RuntimeError(
+        "No embeddings backend configured. Set one of OLLAMA_MODEL, "
+        "OPENAI_API_KEY, or GEMINI_API_KEY in .env."
+    )

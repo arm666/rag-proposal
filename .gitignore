@@ -8,3 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Local env vars
+.env
+
+# Ingested documents & FAISS indexes (regenerate via /api/upload)
+data/uploads/
+data/faiss_index/

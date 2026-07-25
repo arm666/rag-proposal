@@ -112,23 +112,80 @@ See [config.py](config.py) for the selection logic (`get_llm()`).
 
 ```
 rag-proposal/
-├── main.py            # entry point
-├── config.py           # get_llm() — Ollama/OpenAI/Gemini backend selection
-├── .env.example         # provider credentials, corpus path, etc.
-├── retrieval/           # (planned) vector_rag.py, graph_rag.py
-├── ingestion/           # (planned) chunking/embedding, entity/graph extraction
-├── evaluation/          # (planned) RAGAS + LLM-as-a-judge + LangChain callbacks
-└── data/                # (planned) corpus + query set + ground-truth labels
+├── main.py                  # CLI entry point (prints selected LLM backend)
+├── app.py                   # FastAPI backend — upload + chat endpoints, serves static/
+├── config.py                 # get_llm() / get_embeddings() — Ollama/OpenAI/Gemini backend selection
+├── .env.example               # provider credentials
+├── ingestion/
+│   └── vector_index.py         # Stage 1: PDF → chunks → embeddings → FAISS index (persisted)
+├── retrieval/
+│   └── vector_rag.py            # Stage 2+3: top-k retrieval (cosine/ANN) → context-only generation
+├── static/
+│   └── index.html                # chat UI — upload a PDF, ask questions, see cited source chunks
+├── evaluation/                    # (planned) RAGAS + LLM-as-a-judge + LangChain callbacks as a batch harness
+└── data/
+    ├── uploads/                    # ingested PDFs (gitignored)
+    └── faiss_index/<doc_id>/        # one FAISS index per uploaded PDF, keyed by content hash (gitignored)
 ```
 
-The `retrieval/`, `ingestion/`, `evaluation/`, and `data/` directories don't
-exist yet — they're the planned home for the work in the roadmap below.
+Graph RAG, and the batch evaluation harness (RAGAS / LLM-as-a-judge scoring
+across a labeled query set), are not implemented yet — see the roadmap.
 
-## Project status
+## Vector RAG pipeline
 
-Only the LLM backend selection (`config.py`) is implemented so far. The
-retrieval pipelines, corpus ingestion, and evaluation harness described above
-are upcoming work — see the roadmap.
+Implements thesis §3.3.1–3.3.3 for the vector-based half of the comparison:
+
+1. **Ingestion** (`ingestion/vector_index.py`) — `PyPDFLoader` extracts text
+   page-by-page, `RecursiveCharacterTextSplitter` chunks it (1000 chars,
+   150 overlap), each chunk is embedded and stored in a FAISS index persisted
+   to `data/faiss_index/<doc_id>/`, where `doc_id` is a SHA-256 hash of the
+   PDF bytes — re-uploading the same file reuses its existing index.
+2. **Retrieval** (`retrieval/vector_rag.py`) — cosine similarity / ANN search
+   over the FAISS index returns the top-3 chunks for a query.
+3. **Generation** — the same LLM backbone (`get_llm()`), temperature 0, with
+   a system prompt that forces context-only answers (no parametric memory).
+4. **Instrumentation** — every answer reports latency, prompt/completion/total
+   tokens, and cost in USD (via LangChain's OpenAI callback — token/cost
+   figures are populated for the OpenAI backend; local/Gemini backends report
+   latency only, since the callback only instruments OpenAI-compatible calls).
+
+## Web chat UI
+
+`static/index.html`, served by `app.py`, is a single-page chat interface:
+
+- Drag-and-drop or click to upload a PDF — it's chunked, embedded, and
+  indexed on upload.
+- Ask questions in the composer; each answer shows an expandable evidence
+  strip with the exact source chunks (page number + similarity score) it was
+  grounded in, plus latency/token/cost metrics.
+
+### Endpoints (`app.py`)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/upload` | Upload a PDF, build/reuse its FAISS index |
+| `POST` | `/api/chat` | `{doc_id, question}` → answer + sources + metrics |
+| `GET` | `/api/docs` | List indexed `doc_id`s |
+| `GET` | `/` | Chat UI |
+
+## Requirements
+
+- Python 3.11+
+- [uv](https://docs.astral.sh/uv/) for dependency management
+- One of: a local [Ollama](https://ollama.com) server + pulled chat model
+  (embeddings default to `embeddinggemma:latest`, also pulled locally), an
+  OpenAI API key (embeddings default to `text-embedding-3-small`), or a
+  Gemini API key — see [LLM backend selection](#llm-backend-selection)
+
+## Getting started
+
+```bash
+uv sync
+cp .env.example .env   # set OLLAMA_MODEL, OPENAI_API_KEY, or GEMINI_API_KEY
+uv run uvicorn app:app --reload
+```
+
+Then open http://127.0.0.1:8000, upload a PDF, and start asking questions.
 
 ## Roadmap
 
@@ -136,27 +193,14 @@ Mirrors the thesis Gantt chart (Apr–Oct 2026):
 
 1. **Thesis planning & proposal submission** — done.
 2. **System design & framework development** — repo scaffold, LLM backend
-   selection, corpus/query set definition.
-3. **Dataset preparation & implementation** — Vector RAG (FAISS ingestion +
-   retrieval) and Graph RAG (entity extraction, graph construction, BFS
-   traversal) pipelines.
-4. **Experiment execution & data collection** — run both pipelines over the
-   shared query set, log tokens/cost/latency via LangChain callbacks.
-5. **Evaluation & result analysis** — RAGAS + LLM-as-a-judge scoring,
-   cross-pipeline comparison.
+   selection, corpus/query set definition — done.
+3. **Dataset preparation & implementation**:
+   - Vector RAG (FAISS ingestion + retrieval) + chat UI — done.
+   - Graph RAG (entity extraction, graph construction, BFS traversal) —
+     not started.
+4. **Experiment execution & data collection** — run both pipelines over a
+   shared, labeled query set (ground-truth relevant items per query, needed
+   for Retrieval Accuracy / Context Precision / Context Recall) — not started.
+5. **Evaluation & result analysis** — RAGAS + LLM-as-a-judge batch scoring,
+   cross-pipeline comparison — not started.
 6. **Thesis writing, review, revision & final submission**.
-
-## Requirements
-
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) for dependency management
-- One of: a local [Ollama](https://ollama.com) server + pulled model, an
-  OpenAI API key, or a Gemini API key (see [LLM backend selection](#llm-backend-selection))
-
-## Getting started
-
-```bash
-uv sync
-cp .env.example .env   # set OLLAMA_MODEL, OPENAI_API_KEY, or GEMINI_API_KEY
-uv run main.py
-```
