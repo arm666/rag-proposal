@@ -1,4 +1,4 @@
-<title>Vector RAG — Document Query</title>
+<title>RAG Proposal — Document Query</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   @font-face {
@@ -131,6 +131,39 @@
     letter-spacing: 0.04em;
   }
 
+  .mode-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .mode-field label {
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--paper-dim);
+  }
+
+  .mode-select {
+    appearance: none;
+    background: var(--ink-raised);
+    border: 1px solid var(--ink-line);
+    border-radius: 2px;
+    color: var(--paper);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.82rem;
+    padding: 10px 34px 10px 12px;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.15s ease;
+    background-image: linear-gradient(45deg, transparent 50%, var(--amber) 50%),
+      linear-gradient(135deg, var(--amber) 50%, transparent 50%);
+    background-position: calc(100% - 18px) center, calc(100% - 13px) center;
+    background-size: 5px 5px, 5px 5px;
+    background-repeat: no-repeat;
+  }
+  .mode-select:focus { border-color: var(--amber); }
+
   .status-line {
     font-size: 0.72rem;
     color: var(--paper-dim);
@@ -139,6 +172,22 @@
     align-items: center;
     min-height: 1.2em;
   }
+
+  .clear-btn {
+    background: none;
+    border: 1px solid var(--ink-line);
+    border-radius: 2px;
+    color: var(--paper-dim);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 8px 12px;
+    cursor: pointer;
+    transition: border-color 0.15s ease, color 0.15s ease;
+  }
+  .clear-btn:hover:not(:disabled) { border-color: var(--red); color: var(--red); }
+  .clear-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
   .status-line .dot {
     width: 6px;
@@ -243,6 +292,28 @@
     gap: 14px;
   }
 
+  .a-columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+
+  @media (max-width: 720px) {
+    .a-columns { grid-template-columns: 1fr; }
+  }
+
+  .a-column {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 0;
+  }
+
+  .a-column.graph { border-left: 1px solid var(--ink-line); padding-left: 20px; }
+  @media (max-width: 720px) {
+    .a-column.graph { border-left: none; padding-left: 0; border-top: 1px solid var(--ink-line); padding-top: 16px; }
+  }
+
   .a-label {
     font-size: 0.68rem;
     letter-spacing: 0.14em;
@@ -252,6 +323,9 @@
     align-items: center;
     gap: 10px;
   }
+
+  .a-label.graph-label { color: var(--green); }
+  .a-label .rule.graph-rule { background: var(--ink-line); }
 
   .a-label .rule { flex: 1; height: 1px; background: var(--ink-line); }
 
@@ -408,6 +482,28 @@
   }
   .metrics span b { color: var(--paper); }
 
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .chip {
+    font-size: 0.7rem;
+    color: var(--paper);
+    background: var(--ink-raised);
+    border: 1px solid var(--ink-line);
+    border-radius: 12px;
+    padding: 3px 10px;
+  }
+
+  .triplet {
+    font-size: 0.78rem;
+    color: var(--paper-dim);
+  }
+  .triplet b { color: var(--paper); font-weight: 500; }
+  .triplet .rel { color: var(--green); }
+
   .composer {
     border-top: 1px solid var(--ink-line);
     padding: 18px clamp(20px, 6vw, 96px) 24px;
@@ -471,9 +567,9 @@
 
 <div class="dock">
   <div class="brand">
-    <span class="mark">Vector RAG</span>
+    <span class="mark">Vector RAG · Graph RAG</span>
     <h1>Document Query</h1>
-    <p>Upload a PDF, then ask questions answered strictly from retrieved context — top-3 chunks, cosine similarity, temperature 0.</p>
+    <p>Upload a PDF, then ask questions answered strictly from retrieved context — vector similarity search, graph traversal, or both side by side.</p>
   </div>
 
   <label class="dropzone" id="dropzone">
@@ -487,9 +583,20 @@
     <div class="meta" id="docMeta">—</div>
   </div>
 
+  <div class="mode-field">
+    <label for="modeSelect">Retrieval mode</label>
+    <select class="mode-select" id="modeSelect">
+      <option value="vector">Vector RAG</option>
+      <option value="graph">Graph RAG</option>
+      <option value="both">Both (compare)</option>
+    </select>
+  </div>
+
   <div class="status-line" id="status"><span class="dot"></span><span id="statusText">No document loaded</span></div>
 
-  <div class="pipeline">
+  <button type="button" class="clear-btn" id="clearBtn">Clear all files &amp; indexes</button>
+
+  <div class="pipeline" id="pipelineSteps">
     <div class="step"><b>01</b> Chunk + embed → FAISS index</div>
     <div class="step"><b>02</b> Top-3 ANN retrieval, cosine similarity</div>
     <div class="step"><b>03</b> Context-only generation, temp = 0</div>
@@ -528,8 +635,42 @@
   const chatForm = document.getElementById('chatForm');
   const questionInput = document.getElementById('question');
   const sendBtn = document.getElementById('sendBtn');
+  const modeSelect = document.getElementById('modeSelect');
+  const pipelineSteps = document.getElementById('pipelineSteps');
+  const clearBtn = document.getElementById('clearBtn');
 
   let docId = null;
+  let docChunks = 0;
+  let docTriplets = 0;
+
+  const PIPELINE_STEPS = {
+    vector: [
+      ['01', 'Chunk + embed → FAISS index'],
+      ['02', 'Top-3 ANN retrieval, cosine similarity'],
+      ['03', 'Context-only generation, temp = 0'],
+      ['04', 'Sources + token/cost/latency logged'],
+    ],
+    graph: [
+      ['01', 'Entity extraction → NetworkX knowledge graph'],
+      ['02', 'Query entities matched to nodes, BFS 2 hops'],
+      ['03', 'Context-only generation, temp = 0'],
+      ['04', 'Triplets + token/cost/latency logged'],
+    ],
+    both: [
+      ['01', 'Both indexes built on upload'],
+      ['02', 'Vector ANN + Graph BFS run in parallel'],
+      ['03', 'Same LLM, temp = 0, identical prompt'],
+      ['04', 'Side-by-side comparison logged'],
+    ],
+  };
+
+  function renderPipelineSteps(mode) {
+    pipelineSteps.innerHTML = PIPELINE_STEPS[mode]
+      .map(([n, label]) => `<div class="step"><b>${n}</b> ${label}</div>`)
+      .join('');
+  }
+  modeSelect.addEventListener('change', () => renderPipelineSteps(modeSelect.value));
+  renderPipelineSteps(modeSelect.value);
 
   function setStatus(mode, text) {
     statusLine.className = 'status-line' + (mode ? ' ' + mode : '');
@@ -581,8 +722,10 @@
       }
       const data = await res.json();
       docId = data.doc_id;
+      docChunks = data.chunks;
+      docTriplets = data.triplets;
       docName.textContent = data.filename;
-      docMeta.textContent = `${data.chunks} chunks indexed`;
+      docMeta.textContent = `${data.chunks} chunks · ${data.triplets} triplets`;
       docCard.classList.add('active');
       setStatus('ok', 'Ready — ask a question');
       questionInput.disabled = false;
@@ -592,6 +735,48 @@
       setStatus('err', e.message || 'Upload failed');
     }
   }
+
+  clearBtn.addEventListener('click', async () => {
+    if (!confirm('Delete all uploaded files and indexes? This cannot be undone.')) return;
+
+    clearBtn.disabled = true;
+    setStatus('busy', 'Clearing all files & indexes…');
+
+    try {
+      const res = await fetch('/api/docs', { method: 'DELETE' });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `Clear failed (${res.status})`);
+      }
+
+      docId = null;
+      docChunks = 0;
+      docTriplets = 0;
+      docCard.classList.remove('active');
+      docName.textContent = '—';
+      docMeta.textContent = '—';
+      fileInput.value = '';
+
+      questionInput.disabled = true;
+      sendBtn.disabled = true;
+
+      thread.innerHTML = '';
+      const empty = el('div', 'empty');
+      empty.id = 'emptyState';
+      empty.innerHTML = `
+        <div class="glyph">§</div>
+        <h2>No document indexed yet</h2>
+        <p>Upload a PDF on the left. Once it's chunked and embedded, ask it anything — every answer cites the exact passages it was built from.</p>
+      `;
+      thread.appendChild(empty);
+
+      setStatus(null, 'No document loaded');
+    } catch (e) {
+      setStatus('err', e.message || 'Clear failed');
+    } finally {
+      clearBtn.disabled = false;
+    }
+  });
 
   function el(tag, cls, text) {
     const n = document.createElement(tag);
@@ -710,46 +895,111 @@
     return { turn, aBlock, thinking, stop: () => clearTimeout(timer) };
   }
 
-  function renderTurn(pending, result) {
-    const { turn, aBlock, thinking, stop } = pending;
-    stop();
-    thinking.remove();
+  function renderVectorSources(container, sources) {
+    if (!sources || !sources.length) return;
+    const evidence = document.createElement('details');
+    evidence.className = 'evidence';
+    const summary = el('summary', null, `${sources.length} source chunk${sources.length > 1 ? 's' : ''}`);
+    evidence.appendChild(summary);
 
-    const aText = el('div', 'a-text');
-    aText.innerHTML = renderMarkdown(result.answer);
-    aBlock.appendChild(aText);
+    const strip = el('div', 'strip');
+    sources.forEach((s) => {
+      const cite = el('div', 'cite');
+      const head = el('div', 'cite-head');
+      const pageLabel = (s.page !== null && s.page !== undefined) ? `p.${s.page + 1}` : `chunk ${s.chunk_id}`;
+      head.append(el('span', null, pageLabel), el('span', null, s.score.toFixed(3)));
+      cite.appendChild(head);
+      cite.appendChild(el('div', null, s.text.length > 320 ? s.text.slice(0, 320) + '…' : s.text));
+      const bar = el('div', 'score-bar');
+      const fill = el('div', 'score-fill');
+      fill.style.width = `${Math.max(0, Math.min(1, s.score)) * 100}%`;
+      bar.appendChild(fill);
+      cite.appendChild(bar);
+      strip.appendChild(cite);
+    });
+    evidence.appendChild(strip);
+    container.appendChild(evidence);
+  }
 
-    if (result.sources && result.sources.length) {
-      const evidence = document.createElement('details');
-      evidence.className = 'evidence';
-      const summary = el('summary', null, `${result.sources.length} source chunk${result.sources.length > 1 ? 's' : ''}`);
-      evidence.appendChild(summary);
-
-      const strip = el('div', 'strip');
-      result.sources.forEach((s) => {
-        const cite = el('div', 'cite');
-        const head = el('div', 'cite-head');
-        const pageLabel = (s.page !== null && s.page !== undefined) ? `p.${s.page + 1}` : `chunk ${s.chunk_id}`;
-        head.append(el('span', null, pageLabel), el('span', null, s.score.toFixed(3)));
-        cite.appendChild(head);
-        cite.appendChild(el('div', null, s.text.length > 320 ? s.text.slice(0, 320) + '…' : s.text));
-        const bar = el('div', 'score-bar');
-        const fill = el('div', 'score-fill');
-        fill.style.width = `${Math.max(0, Math.min(1, s.score)) * 100}%`;
-        bar.appendChild(fill);
-        cite.appendChild(bar);
-        strip.appendChild(cite);
-      });
-      evidence.appendChild(strip);
-      aBlock.appendChild(evidence);
+  function renderGraphTriplets(container, triplets, matchedEntities) {
+    if (matchedEntities && matchedEntities.length) {
+      const chips = el('div', 'chips');
+      matchedEntities.forEach((e) => chips.appendChild(el('span', 'chip', e)));
+      container.appendChild(chips);
     }
+    if (!triplets || !triplets.length) return;
+    const evidence = document.createElement('details');
+    evidence.className = 'evidence';
+    const summary = el('summary', null, `${triplets.length} relationship triplet${triplets.length > 1 ? 's' : ''}`);
+    evidence.appendChild(summary);
 
+    const strip = el('div', 'strip');
+    triplets.forEach((t) => {
+      const cite = el('div', 'cite');
+      const head = el('div', 'cite-head');
+      const pageLabel = (t.page !== null && t.page !== undefined) ? `p.${t.page + 1}` : '';
+      head.append(el('span', null, pageLabel));
+      cite.appendChild(head);
+      const row = el('div', 'triplet');
+      row.innerHTML = `<b>${escapeHtml(t.subject)}</b> <span class="rel">${escapeHtml(t.relation)}</span> <b>${escapeHtml(t.object)}</b>`;
+      cite.appendChild(row);
+      strip.appendChild(cite);
+    });
+    evidence.appendChild(strip);
+    container.appendChild(evidence);
+  }
+
+  function renderMetrics(container, result) {
     const metrics = el('div', 'metrics');
     metrics.innerHTML = `
       <span>latency <b>${result.latency_seconds.toFixed(2)}s</b></span>
       <span>tokens <b>${result.total_tokens || '—'}</b></span>
+      <span>cost <b>${result.cost_usd ? '$' + result.cost_usd.toFixed(5) : '—'}</b></span>
     `;
-    aBlock.appendChild(metrics);
+    container.appendChild(metrics);
+  }
+
+  function buildPipelineColumn(labelText, labelClass, ruleClass, result, kind) {
+    const col = el('div', kind === 'graph' ? 'a-column graph' : 'a-column vector');
+    const label = el('div', 'a-label' + (labelClass ? ' ' + labelClass : ''));
+    label.append(labelText, el('span', 'rule' + (ruleClass ? ' ' + ruleClass : '')));
+    col.appendChild(label);
+
+    const aText = el('div', 'a-text');
+    aText.innerHTML = renderMarkdown(result.answer);
+    col.appendChild(aText);
+
+    if (kind === 'graph') {
+      renderGraphTriplets(col, result.triplets, result.matched_entities);
+    } else {
+      renderVectorSources(col, result.sources);
+    }
+    renderMetrics(col, result);
+    return col;
+  }
+
+  function renderTurn(pending, response) {
+    const { turn, aBlock, thinking, stop } = pending;
+    stop();
+    thinking.remove();
+
+    if (response.mode === 'both') {
+      aBlock.classList.add('a-columns');
+      if (response.vector) aBlock.appendChild(buildPipelineColumn('Vector RAG', null, null, response.vector, 'vector'));
+      if (response.graph) aBlock.appendChild(buildPipelineColumn('Graph RAG', 'graph-label', 'graph-rule', response.graph, 'graph'));
+    } else if (response.mode === 'graph' && response.graph) {
+      const aText = el('div', 'a-text');
+      aText.innerHTML = renderMarkdown(response.graph.answer);
+      aBlock.appendChild(aText);
+      renderGraphTriplets(aBlock, response.graph.triplets, response.graph.matched_entities);
+      renderMetrics(aBlock, response.graph);
+    } else if (response.vector) {
+      const aText = el('div', 'a-text');
+      aText.innerHTML = renderMarkdown(response.vector.answer);
+      aBlock.appendChild(aText);
+      renderVectorSources(aBlock, response.vector.sources);
+      renderMetrics(aBlock, response.vector);
+    }
 
     turn.appendChild(aBlock);
     thread.appendChild(turn);
@@ -765,15 +1015,16 @@
     autoGrow();
     questionInput.disabled = true;
     sendBtn.disabled = true;
-    setStatus('busy', 'Retrieving + generating…');
+    setStatus('busy', mode === 'both' ? 'Running vector + graph retrieval…' : `Retrieving (${mode}) + generating…`);
 
     const pending = renderQuestion(question);
+    const mode = modeSelect.value;
 
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ doc_id: docId, question }),
+        body: JSON.stringify({ doc_id: docId, question, mode }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));

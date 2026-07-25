@@ -1,16 +1,26 @@
-"""Web backend for the Vector RAG chat UI.
+"""Web backend for the Vector RAG / Graph RAG chat UI.
 
 Exposes:
-  POST /api/upload  — upload a PDF, ingest it into a FAISS index (Stage 1)
-  POST /api/chat     — ask a question against an ingested PDF (Stage 2+3)
-  GET  /api/docs      — list already-ingested documents
-  GET  /            — chat UI (static/index.html)
+  POST   /api/upload  — upload a PDF, build/reuse its FAISS + graph indexes (Stage 1)
+  POST   /api/chat     — ask a question against an ingested PDF (Stage 2+3),
+                        against the vector pipeline, the graph pipeline, or both
+  GET    /api/docs      — list already-ingested documents
+  DELETE /api/docs      — clear all uploaded files and indexes from local storage
+  GET    /            — chat UI (static/index.html)
+
+All uploads and indexes are persisted under data/ on the local filesystem
+(data/uploads, data/faiss_index, data/graph_index), keyed by a content hash
+of the PDF. Because doc_id is derived from file content and existence is
+checked on disk, re-uploading the same PDF after a server restart reuses the
+already-built indexes instead of rebuilding them.
 """
 
 from __future__ import annotations
 
 import hashlib
+import shutil
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +28,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from ingestion.graph_index import build_graph_index, graph_index_exists
 from ingestion.vector_index import build_index, index_exists, list_indexed_docs
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -25,7 +36,7 @@ UPLOAD_DIR = BASE_DIR / "data" / "uploads"
 STATIC_DIR = BASE_DIR / "static"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Vector RAG Chat")
+app = FastAPI(title="Vector RAG / Graph RAG Chat")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,10 +45,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+Mode = Literal["vector", "graph", "both"]
+
 
 class ChatRequest(BaseModel):
     doc_id: str
     question: str
+    mode: Mode = "vector"
 
 
 class ChatSource(BaseModel):
@@ -47,9 +61,18 @@ class ChatSource(BaseModel):
     score: float
 
 
-class ChatResponse(BaseModel):
+class ChatTriplet(BaseModel):
+    subject: str
+    relation: str
+    object: str
+    page: int | None
+
+
+class PipelineResult(BaseModel):
     answer: str
-    sources: list[ChatSource]
+    sources: list[ChatSource] = []
+    triplets: list[ChatTriplet] = []
+    matched_entities: list[str] = []
     latency_seconds: float
     prompt_tokens: int
     completion_tokens: int
@@ -57,10 +80,17 @@ class ChatResponse(BaseModel):
     cost_usd: float
 
 
+class ChatResponse(BaseModel):
+    mode: Mode
+    vector: PipelineResult | None = None
+    graph: PipelineResult | None = None
+
+
 class DocInfo(BaseModel):
     doc_id: str
     filename: str
     chunks: int
+    triplets: int
 
 
 @app.post("/api/upload", response_model=DocInfo)
@@ -75,25 +105,46 @@ async def upload_pdf(file: UploadFile = File(...)) -> DocInfo:
     doc_id = hashlib.sha256(raw).hexdigest()[:16]
     pdf_path = UPLOAD_DIR / f"{doc_id}.pdf"
 
-    if not index_exists(doc_id):
+    if not pdf_path.exists():
         pdf_path.write_bytes(raw)
+
+    if not index_exists(doc_id):
         try:
             chunks = build_index(pdf_path, doc_id)
         except Exception as exc:
-            pdf_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=500, detail=f"Failed to index PDF: {exc}") from exc
+            raise HTTPException(status_code=500, detail=f"Failed to build vector index: {exc}") from exc
     else:
-        # Already indexed (same content hash) — just report chunk count via a fresh load.
         from ingestion.vector_index import load_index
 
         chunks = load_index(doc_id).index.ntotal
 
-    return DocInfo(doc_id=doc_id, filename=file.filename, chunks=chunks)
+    if not graph_index_exists(doc_id):
+        try:
+            triplets = build_graph_index(pdf_path, doc_id)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to build graph index: {exc}") from exc
+    else:
+        import json
+
+        graph_file = BASE_DIR / "data" / "graph_index" / doc_id / "graph.json"
+        triplets = len(json.loads(graph_file.read_text(encoding="utf-8")).get("triplets", []))
+
+    return DocInfo(doc_id=doc_id, filename=file.filename, chunks=chunks, triplets=triplets)
 
 
 @app.get("/api/docs", response_model=list[str])
 async def get_docs() -> list[str]:
     return list_indexed_docs()
+
+
+@app.delete("/api/docs")
+async def clear_docs() -> dict[str, bool]:
+    """Remove all uploaded PDFs and built indexes from local storage."""
+    for directory in (UPLOAD_DIR, BASE_DIR / "data" / "faiss_index", BASE_DIR / "data" / "graph_index"):
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+    return {"cleared": True}
 
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -103,22 +154,47 @@ async def chat(req: ChatRequest) -> ChatResponse:
     if not index_exists(req.doc_id):
         raise HTTPException(status_code=404, detail="Unknown doc_id — upload the PDF first.")
 
-    from retrieval.vector_rag import answer_question
+    vector_result = None
+    graph_result = None
 
-    try:
-        result = answer_question(req.doc_id, req.question)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to answer question: {exc}") from exc
+    if req.mode in ("vector", "both"):
+        from retrieval.vector_rag import answer_question as vector_answer
 
-    return ChatResponse(
-        answer=result.answer,
-        sources=[ChatSource(**s.__dict__) for s in result.sources],
-        latency_seconds=result.latency_seconds,
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-        total_tokens=result.total_tokens,
-        cost_usd=result.cost_usd,
-    )
+        try:
+            result = vector_answer(req.doc_id, req.question)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Vector RAG failed: {exc}") from exc
+        vector_result = PipelineResult(
+            answer=result.answer,
+            sources=[ChatSource(**s.__dict__) for s in result.sources],
+            latency_seconds=result.latency_seconds,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            cost_usd=result.cost_usd,
+        )
+
+    if req.mode in ("graph", "both"):
+        if not graph_index_exists(req.doc_id):
+            raise HTTPException(status_code=404, detail="No graph index for this document — re-upload it.")
+        from retrieval.graph_rag import answer_question as graph_answer
+
+        try:
+            result = graph_answer(req.doc_id, req.question)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Graph RAG failed: {exc}") from exc
+        graph_result = PipelineResult(
+            answer=result.answer,
+            triplets=[ChatTriplet(**t.__dict__) for t in result.triplets],
+            matched_entities=result.matched_entities,
+            latency_seconds=result.latency_seconds,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            cost_usd=result.cost_usd,
+        )
+
+    return ChatResponse(mode=req.mode, vector=vector_result, graph=graph_result)
 
 
 @app.get("/")

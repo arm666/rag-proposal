@@ -44,8 +44,8 @@ Generated Output  Generated Output
 
 | Stage | Vector RAG | Graph RAG |
 |---|---|---|
-| 1. Ingestion | Chunk + embed, stored in FAISS index | Entity/relationship extraction via LLM → graph (NetworkX/Neo4j), serialized as JSON triplets |
-| 2. Retrieval | Top-3 chunks via cosine similarity / ANN | Extract query entities → match graph nodes → BFS traversal (2 hops, up to 20 triplets) |
+| 1. Ingestion | Chunk + embed, stored in FAISS index | LLM extracts entity-relationship triplets per chunk → NetworkX `MultiDiGraph`, persisted as JSON |
+| 2. Retrieval | Top-3 chunks via cosine similarity / ANN | LLM extracts query entities → fuzzy-matched to graph nodes → BFS traversal (2 hops, up to 20 triplets) |
 | 3. Generation | Same LLM, temperature 0, identical context-only prompt | Same LLM, temperature 0, identical context-only prompt |
 | 4. Evaluation | RAGAS + LLM-as-a-judge + LangChain callbacks | RAGAS + LLM-as-a-judge + LangChain callbacks |
 
@@ -82,7 +82,7 @@ preparation" roadmap phase.
 | Embeddings | Hugging Face sentence embeddings |
 | Vector store | FAISS |
 | Vector retrieval | Cosine similarity / Approximate Nearest Neighbor (ANN) |
-| Graph store | NetworkX (dev) / Neo4j |
+| Graph store | NetworkX, persisted as JSON triplets (`data/graph_index/<doc_id>/graph.json`) |
 | Graph retrieval | Breadth-First Search (BFS) traversal |
 | Evaluation | RAGAS, LLM-as-a-judge, LangChain callbacks |
 | Language | Python 3.11 |
@@ -117,19 +117,22 @@ rag-proposal/
 ├── config.py                 # get_llm() / get_embeddings() — Ollama/OpenAI/Gemini backend selection
 ├── .env.example               # provider credentials
 ├── ingestion/
-│   └── vector_index.py         # Stage 1: PDF → chunks → embeddings → FAISS index (persisted)
+│   ├── vector_index.py          # Stage 1: PDF → chunks → embeddings → FAISS index (persisted)
+│   └── graph_index.py            # Stage 1: PDF → LLM entity/relationship extraction → NetworkX graph (persisted as JSON)
 ├── retrieval/
-│   └── vector_rag.py            # Stage 2+3: top-k retrieval (cosine/ANN) → context-only generation
+│   ├── vector_rag.py             # Stage 2+3: top-k retrieval (cosine/ANN) → context-only generation
+│   └── graph_rag.py               # Stage 2+3: query entity extraction → BFS traversal (2 hops) → context-only generation
 ├── static/
-│   └── index.html                # chat UI — upload a PDF, ask questions, see cited source chunks
-├── evaluation/                    # (planned) RAGAS + LLM-as-a-judge + LangChain callbacks as a batch harness
+│   └── index.html                  # chat UI — upload a PDF, pick Vector/Graph/Both, see cited evidence
+├── evaluation/                      # (planned) RAGAS + LLM-as-a-judge + LangChain callbacks as a batch harness
 └── data/
-    ├── uploads/                    # ingested PDFs (gitignored)
-    └── faiss_index/<doc_id>/        # one FAISS index per uploaded PDF, keyed by content hash (gitignored)
+    ├── uploads/                      # ingested PDFs (gitignored)
+    ├── faiss_index/<doc_id>/          # one FAISS index per uploaded PDF, keyed by content hash (gitignored)
+    └── graph_index/<doc_id>/graph.json # one knowledge graph per uploaded PDF, same content hash (gitignored)
 ```
 
-Graph RAG, and the batch evaluation harness (RAGAS / LLM-as-a-judge scoring
-across a labeled query set), are not implemented yet — see the roadmap.
+The batch evaluation harness (RAGAS / LLM-as-a-judge scoring across a labeled
+query set) is not implemented yet — see the roadmap.
 
 ## Vector RAG pipeline
 
@@ -149,22 +152,51 @@ Implements thesis §3.3.1–3.3.3 for the vector-based half of the comparison:
    figures are populated for the OpenAI backend; local/Gemini backends report
    latency only, since the callback only instruments OpenAI-compatible calls).
 
+## Graph RAG pipeline
+
+Implements thesis §3.3.1–3.3.3 for the graph-based half of the comparison:
+
+1. **Ingestion** (`ingestion/graph_index.py`) — `PyPDFLoader` extracts text
+   page-by-page, chunked (2000 chars, 200 overlap — larger than the vector
+   chunks since entity extraction benefits from more surrounding context per
+   LLM call). Each chunk is sent to the LLM backbone with a prompt that
+   returns `{subject, relation, object}` triplets as JSON. Triplets are
+   assembled into a NetworkX `MultiDiGraph` and persisted as
+   `data/graph_index/<doc_id>/graph.json`, keyed by the same content-hash
+   `doc_id` as the vector index.
+2. **Retrieval** (`retrieval/graph_rag.py`) — the LLM extracts entities from
+   the query, each is fuzzy-matched against graph node labels (exact match,
+   substring, then `SequenceMatcher` similarity ≥ 0.6), and a breadth-first
+   search from the matched nodes — traversing edges in both directions, up to
+   2 hops — collects up to 20 relationship triplets.
+3. **Generation** — identical to Vector RAG: same LLM backbone, temperature
+   0, context-only system prompt. The retrieved triplets are serialized as
+   `subject —[relation]→ object` lines and passed as context.
+4. **Instrumentation** — same latency/token/cost reporting as Vector RAG, via
+   LangChain's OpenAI callback.
+
 ## Web chat UI
 
 `static/index.html`, served by `app.py`, is a single-page chat interface:
 
-- Drag-and-drop or click to upload a PDF — it's chunked, embedded, and
-  indexed on upload.
-- Ask questions in the composer; each answer shows an expandable evidence
-  strip with the exact source chunks (page number + similarity score) it was
-  grounded in, plus latency/token/cost metrics.
+- Drag-and-drop or click to upload a PDF — it's chunked/embedded into a FAISS
+  index *and* run through entity extraction into a knowledge graph on upload,
+  so both pipelines are ready immediately.
+- A **retrieval mode** dropdown selects **Vector RAG**, **Graph RAG**, or
+  **Both (compare)** before asking a question.
+- Ask questions in the composer:
+  - Vector/Graph mode shows one answer with its evidence (source chunks with
+    similarity scores, or matched entities + relationship triplets) and
+    latency/token/cost metrics.
+  - Both mode runs both pipelines against the same question and renders them
+    side by side for direct comparison.
 
 ### Endpoints (`app.py`)
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/upload` | Upload a PDF, build/reuse its FAISS index |
-| `POST` | `/api/chat` | `{doc_id, question}` → answer + sources + metrics |
+| `POST` | `/api/upload` | Upload a PDF, build/reuse its FAISS + graph indexes |
+| `POST` | `/api/chat` | `{doc_id, question, mode}` → answer(s) + evidence + metrics (`mode`: `vector` \| `graph` \| `both`) |
 | `GET` | `/api/docs` | List indexed `doc_id`s |
 | `GET` | `/` | Chat UI |
 
@@ -197,7 +229,7 @@ Mirrors the thesis Gantt chart (Apr–Oct 2026):
 3. **Dataset preparation & implementation**:
    - Vector RAG (FAISS ingestion + retrieval) + chat UI — done.
    - Graph RAG (entity extraction, graph construction, BFS traversal) —
-     not started.
+     done. Chat UI has a Vector/Graph/Both mode selector.
 4. **Experiment execution & data collection** — run both pipelines over a
    shared, labeled query set (ground-truth relevant items per query, needed
    for Retrieval Accuracy / Context Precision / Context Recall) — not started.

@@ -12,6 +12,7 @@ wheels/
 # Local env vars
 .env
 
-# Ingested documents & FAISS indexes (regenerate via /api/upload)
+# Ingested documents & indexes (regenerate via /api/upload)
 data/uploads/
 data/faiss_index/
+data/graph_index/
