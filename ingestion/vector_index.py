@@ -60,9 +60,3 @@ def load_index(doc_id: str) -> FAISS:
     return FAISS.load_local(
         str(out_dir), get_embeddings(), allow_dangerous_deserialization=True
     )
-
-
-def list_indexed_docs() -> list[str]:
-    if not INDEX_ROOT.exists():
-        return []
-    return sorted(p.name for p in INDEX_ROOT.iterdir() if (p / "index.faiss").exists())

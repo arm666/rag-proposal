@@ -16,3 +16,4 @@ wheels/
 data/uploads/
 data/faiss_index/
 data/graph_index/
+data/docs.db

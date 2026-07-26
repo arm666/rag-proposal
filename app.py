@@ -13,6 +13,10 @@ All uploads and indexes are persisted under data/ on the local filesystem
 of the PDF. Because doc_id is derived from file content and existence is
 checked on disk, re-uploading the same PDF after a server restart reuses the
 already-built indexes instead of rebuilding them.
+
+Document metadata (filename, chunk/triplet counts) is tracked in a local
+SQLite registry (data/docs.db, see db.py) so GET /api/docs can tell a client
+what's already indexed without it having to re-upload anything.
 """
 
 from __future__ import annotations
@@ -28,8 +32,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from db import clear_documents, list_documents, upsert_document
 from ingestion.graph_index import build_graph_index, graph_index_exists
-from ingestion.vector_index import build_index, index_exists, list_indexed_docs
+from ingestion.vector_index import build_index, index_exists
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
@@ -129,21 +134,25 @@ async def upload_pdf(file: UploadFile = File(...)) -> DocInfo:
         graph_file = BASE_DIR / "data" / "graph_index" / doc_id / "graph.json"
         triplets = len(json.loads(graph_file.read_text(encoding="utf-8")).get("triplets", []))
 
+    upsert_document(doc_id, file.filename, chunks, triplets)
     return DocInfo(doc_id=doc_id, filename=file.filename, chunks=chunks, triplets=triplets)
 
 
-@app.get("/api/docs", response_model=list[str])
-async def get_docs() -> list[str]:
-    return list_indexed_docs()
+@app.get("/api/docs", response_model=list[DocInfo])
+async def get_docs() -> list[DocInfo]:
+    """List already-ingested documents, from the local doc registry — filtered
+    to entries whose vector index is still present on disk."""
+    return [DocInfo(**d) for d in list_documents() if index_exists(d["doc_id"])]
 
 
 @app.delete("/api/docs")
 async def clear_docs() -> dict[str, bool]:
-    """Remove all uploaded PDFs and built indexes from local storage."""
+    """Remove all uploaded PDFs, built indexes, and the doc registry from local storage."""
     for directory in (UPLOAD_DIR, BASE_DIR / "data" / "faiss_index", BASE_DIR / "data" / "graph_index"):
         if directory.exists():
             shutil.rmtree(directory)
         directory.mkdir(parents=True, exist_ok=True)
+    clear_documents()
     return {"cleared": True}
 
 

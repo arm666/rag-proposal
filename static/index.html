@@ -131,6 +131,59 @@
     letter-spacing: 0.04em;
   }
 
+  .doc-list-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .doc-list-field label {
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--paper-dim);
+  }
+
+  .doc-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+
+  .doc-list:empty::after {
+    content: "No indexed documents yet";
+    font-size: 0.76rem;
+    color: var(--paper-dim);
+  }
+
+  .doc-item {
+    border: 1px solid var(--ink-line);
+    border-radius: 2px;
+    padding: 8px 12px;
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+  .doc-item:hover { border-color: var(--amber); }
+  .doc-item.active { border-color: var(--amber); background: rgba(217, 143, 48, 0.06); }
+
+  .doc-item .doc-item-name {
+    font-family: "Source Serif", Georgia, serif;
+    font-size: 0.85rem;
+    color: var(--paper);
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .doc-item .doc-item-meta {
+    font-size: 0.68rem;
+    color: var(--amber);
+    margin-top: 2px;
+  }
+
   .mode-field {
     display: flex;
     flex-direction: column;
@@ -295,23 +348,36 @@
   .a-columns {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 20px;
+    grid-template-rows: auto auto auto auto;
+    column-gap: 20px;
+    row-gap: 14px;
   }
 
   @media (max-width: 720px) {
-    .a-columns { grid-template-columns: 1fr; }
+    .a-columns { grid-template-columns: 1fr; grid-template-rows: none; }
   }
 
+  /* Each column is a subgrid sharing the parent's row tracks, so the label,
+     answer, evidence, and metrics of the vector/graph columns line up row
+     for row regardless of how much text either side renders. */
   .a-column {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
+    display: grid;
+    grid-row: 1 / -1;
+    grid-template-rows: subgrid;
+    row-gap: 14px;
     min-width: 0;
   }
 
   .a-column.graph { border-left: 1px solid var(--ink-line); padding-left: 20px; }
   @media (max-width: 720px) {
+    .a-column { display: flex; flex-direction: column; grid-row: auto; }
     .a-column.graph { border-left: none; padding-left: 0; border-top: 1px solid var(--ink-line); padding-top: 16px; }
+  }
+
+  .evidence-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
   }
 
   .a-label {
@@ -583,6 +649,11 @@
     <div class="meta" id="docMeta">—</div>
   </div>
 
+  <div class="doc-list-field">
+    <label>Indexed documents</label>
+    <div class="doc-list" id="docList"></div>
+  </div>
+
   <div class="mode-field">
     <label for="modeSelect">Retrieval mode</label>
     <select class="mode-select" id="modeSelect">
@@ -600,7 +671,7 @@
     <div class="step"><b>01</b> Chunk + embed → FAISS index</div>
     <div class="step"><b>02</b> Top-3 ANN retrieval, cosine similarity</div>
     <div class="step"><b>03</b> Context-only generation, temp = 0</div>
-    <div class="step"><b>04</b> Sources + token/cost/latency logged</div>
+    <div class="step"><b>04</b> Sources + token/latency logged</div>
   </div>
 </div>
 
@@ -628,10 +699,11 @@
   const docCard = document.getElementById('docCard');
   const docName = document.getElementById('docName');
   const docMeta = document.getElementById('docMeta');
+  const docList = document.getElementById('docList');
   const statusLine = document.getElementById('status');
   const statusText = document.getElementById('statusText');
   const thread = document.getElementById('thread');
-  const emptyState = document.getElementById('emptyState');
+  let emptyState = document.getElementById('emptyState');
   const chatForm = document.getElementById('chatForm');
   const questionInput = document.getElementById('question');
   const sendBtn = document.getElementById('sendBtn');
@@ -642,19 +714,20 @@
   let docId = null;
   let docChunks = 0;
   let docTriplets = 0;
+  let currentDocs = [];
 
   const PIPELINE_STEPS = {
     vector: [
       ['01', 'Chunk + embed → FAISS index'],
       ['02', 'Top-3 ANN retrieval, cosine similarity'],
       ['03', 'Context-only generation, temp = 0'],
-      ['04', 'Sources + token/cost/latency logged'],
+      ['04', 'Sources + token/latency logged'],
     ],
     graph: [
       ['01', 'Entity extraction → NetworkX knowledge graph'],
       ['02', 'Query entities matched to nodes, BFS 2 hops'],
       ['03', 'Context-only generation, temp = 0'],
-      ['04', 'Triplets + token/cost/latency logged'],
+      ['04', 'Triplets + token/latency logged'],
     ],
     both: [
       ['01', 'Both indexes built on upload'],
@@ -675,6 +748,62 @@
   function setStatus(mode, text) {
     statusLine.className = 'status-line' + (mode ? ' ' + mode : '');
     statusText.textContent = text;
+  }
+
+  // Doc registry is authoritative server-side (SQLite, see db.py) — the
+  // frontend never invents doc metadata, it just reflects whatever
+  // GET /api/docs reports.
+  async function fetchDocs() {
+    try {
+      const res = await fetch('/api/docs');
+      if (!res.ok) return [];
+      return await res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  function renderDocList(docs) {
+    docList.innerHTML = '';
+    docs.forEach((d) => {
+      const item = el('div', 'doc-item' + (d.doc_id === docId ? ' active' : ''));
+      item.appendChild(el('span', 'doc-item-name', d.filename));
+      item.appendChild(el('span', 'doc-item-meta', `${d.chunks} chunks · ${d.triplets} triplets`));
+      item.addEventListener('click', () => { if (d.doc_id !== docId) activateDoc(d); });
+      docList.appendChild(item);
+    });
+  }
+
+  function showEmptyState(active) {
+    thread.innerHTML = '';
+    emptyState = el('div', 'empty');
+    emptyState.id = 'emptyState';
+    emptyState.innerHTML = active
+      ? `
+        <div class="glyph">§</div>
+        <h2>Ready to answer</h2>
+        <p>Ask anything about this document — every answer cites the exact passages it was built from.</p>
+      `
+      : `
+        <div class="glyph">§</div>
+        <h2>No document indexed yet</h2>
+        <p>Upload a PDF on the left. Once it's chunked and embedded, ask it anything — every answer cites the exact passages it was built from.</p>
+      `;
+    thread.appendChild(emptyState);
+  }
+
+  function activateDoc(doc) {
+    docId = doc.doc_id;
+    docChunks = doc.chunks;
+    docTriplets = doc.triplets;
+    docName.textContent = doc.filename;
+    docMeta.textContent = `${doc.chunks} chunks · ${doc.triplets} triplets`;
+    docCard.classList.add('active');
+    setStatus('ok', 'Ready — ask a question');
+    questionInput.disabled = false;
+    sendBtn.disabled = false;
+    showEmptyState(true);
+    renderDocList(currentDocs);
   }
 
   function autoGrow() {
@@ -721,16 +850,10 @@
         throw new Error(err.detail || `Upload failed (${res.status})`);
       }
       const data = await res.json();
-      docId = data.doc_id;
-      docChunks = data.chunks;
-      docTriplets = data.triplets;
-      docName.textContent = data.filename;
-      docMeta.textContent = `${data.chunks} chunks · ${data.triplets} triplets`;
-      docCard.classList.add('active');
-      setStatus('ok', 'Ready — ask a question');
-      questionInput.disabled = false;
-      sendBtn.disabled = false;
+      activateDoc(data);
       questionInput.focus();
+      currentDocs = await fetchDocs();
+      renderDocList(currentDocs);
     } catch (e) {
       setStatus('err', e.message || 'Upload failed');
     }
@@ -756,19 +879,13 @@
       docName.textContent = '—';
       docMeta.textContent = '—';
       fileInput.value = '';
+      currentDocs = [];
+      renderDocList(currentDocs);
 
       questionInput.disabled = true;
       sendBtn.disabled = true;
 
-      thread.innerHTML = '';
-      const empty = el('div', 'empty');
-      empty.id = 'emptyState';
-      empty.innerHTML = `
-        <div class="glyph">§</div>
-        <h2>No document indexed yet</h2>
-        <p>Upload a PDF on the left. Once it's chunked and embedded, ask it anything — every answer cites the exact passages it was built from.</p>
-      `;
-      thread.appendChild(empty);
+      showEmptyState(false);
 
       setStatus(null, 'No document loaded');
     } catch (e) {
@@ -870,7 +987,7 @@
   }
 
   function renderQuestion(question) {
-    if (emptyState) emptyState.remove();
+    if (emptyState) { emptyState.remove(); emptyState = null; }
 
     const turn = el('div', 'turn');
     turn.appendChild(el('div', 'q', question));
@@ -895,8 +1012,13 @@
     return { turn, aBlock, thinking, stop: () => clearTimeout(timer) };
   }
 
-  function renderVectorSources(container, sources) {
-    if (!sources || !sources.length) return;
+  // Both builders return a single wrapper div (never nothing) so vector and
+  // graph columns always contribute the same number of elements in the same
+  // order — required for the "evidence" row to line up via CSS subgrid.
+  function buildVectorEvidence(sources) {
+    const wrap = el('div', 'evidence-wrap');
+    if (!sources || !sources.length) return wrap;
+
     const evidence = document.createElement('details');
     evidence.className = 'evidence';
     const summary = el('summary', null, `${sources.length} source chunk${sources.length > 1 ? 's' : ''}`);
@@ -918,16 +1040,19 @@
       strip.appendChild(cite);
     });
     evidence.appendChild(strip);
-    container.appendChild(evidence);
+    wrap.appendChild(evidence);
+    return wrap;
   }
 
-  function renderGraphTriplets(container, triplets, matchedEntities) {
+  function buildGraphEvidence(triplets, matchedEntities) {
+    const wrap = el('div', 'evidence-wrap');
     if (matchedEntities && matchedEntities.length) {
       const chips = el('div', 'chips');
       matchedEntities.forEach((e) => chips.appendChild(el('span', 'chip', e)));
-      container.appendChild(chips);
+      wrap.appendChild(chips);
     }
-    if (!triplets || !triplets.length) return;
+    if (!triplets || !triplets.length) return wrap;
+
     const evidence = document.createElement('details');
     evidence.className = 'evidence';
     const summary = el('summary', null, `${triplets.length} relationship triplet${triplets.length > 1 ? 's' : ''}`);
@@ -946,7 +1071,8 @@
       strip.appendChild(cite);
     });
     evidence.appendChild(strip);
-    container.appendChild(evidence);
+    wrap.appendChild(evidence);
+    return wrap;
   }
 
   function renderMetrics(container, result) {
@@ -954,7 +1080,6 @@
     metrics.innerHTML = `
       <span>latency <b>${result.latency_seconds.toFixed(2)}s</b></span>
       <span>tokens <b>${result.total_tokens || '—'}</b></span>
-      <span>cost <b>${result.cost_usd ? '$' + result.cost_usd.toFixed(5) : '—'}</b></span>
     `;
     container.appendChild(metrics);
   }
@@ -969,11 +1094,11 @@
     aText.innerHTML = renderMarkdown(result.answer);
     col.appendChild(aText);
 
-    if (kind === 'graph') {
-      renderGraphTriplets(col, result.triplets, result.matched_entities);
-    } else {
-      renderVectorSources(col, result.sources);
-    }
+    col.appendChild(
+      kind === 'graph'
+        ? buildGraphEvidence(result.triplets, result.matched_entities)
+        : buildVectorEvidence(result.sources)
+    );
     renderMetrics(col, result);
     return col;
   }
@@ -991,13 +1116,13 @@
       const aText = el('div', 'a-text');
       aText.innerHTML = renderMarkdown(response.graph.answer);
       aBlock.appendChild(aText);
-      renderGraphTriplets(aBlock, response.graph.triplets, response.graph.matched_entities);
+      aBlock.appendChild(buildGraphEvidence(response.graph.triplets, response.graph.matched_entities));
       renderMetrics(aBlock, response.graph);
     } else if (response.vector) {
       const aText = el('div', 'a-text');
       aText.innerHTML = renderMarkdown(response.vector.answer);
       aBlock.appendChild(aText);
-      renderVectorSources(aBlock, response.vector.sources);
+      aBlock.appendChild(buildVectorEvidence(response.vector.sources));
       renderMetrics(aBlock, response.vector);
     }
 
@@ -1015,10 +1140,10 @@
     autoGrow();
     questionInput.disabled = true;
     sendBtn.disabled = true;
+    const mode = modeSelect.value;
     setStatus('busy', mode === 'both' ? 'Running vector + graph retrieval…' : `Retrieving (${mode}) + generating…`);
 
     const pending = renderQuestion(question);
-    const mode = modeSelect.value;
 
     try {
       const res = await fetch('/api/chat', {
@@ -1043,4 +1168,12 @@
       questionInput.focus();
     }
   });
+
+  // Restore state on load: ask the API what's already indexed instead of
+  // assuming a blank slate, so a refresh doesn't lose an already-built index.
+  (async function init() {
+    currentDocs = await fetchDocs();
+    renderDocList(currentDocs);
+    if (currentDocs.length) activateDoc(currentDocs[currentDocs.length - 1]);
+  })();
 </script>
