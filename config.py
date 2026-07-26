@@ -6,12 +6,15 @@ load_dotenv()
 
 
 def get_llm(temperature: float = 0):
-    """Return a chat LLM, picked by provider priority.
-
-    1. Ollama   — used when OLLAMA_MODEL is set (local model, no API key needed).
-    2. OpenAI   — used when OPENAI_API_KEY is set.
-    3. Gemini   — used when GEMINI_API_KEY is set.
     """
+    Return a chat LLM using the first available backend.
+
+    Priority:
+    1. Ollama
+    2. OpenAI
+    3. Gemini
+    """
+
     ollama_model = os.getenv("OLLAMA_MODEL")
     if ollama_model:
         from langchain_ollama import ChatOllama
@@ -43,21 +46,21 @@ def get_llm(temperature: float = 0):
         )
 
     raise RuntimeError(
-        "No LLM backend configured. Set one of OLLAMA_MODEL, OPENAI_API_KEY, "
-        "or GEMINI_API_KEY in .env."
+        "No LLM backend configured. Set one of "
+        "OLLAMA_MODEL, OPENAI_API_KEY, or GEMINI_API_KEY in .env."
     )
 
 
 def get_embeddings():
-    """Return an embeddings model, picked by the same provider priority as get_llm().
-
-    1. Ollama — used when OLLAMA_MODEL is set. Embeds with OLLAMA_EMBED_MODEL
-       (defaults to embeddinggemma:latest), served by the same Ollama instance.
-    2. OpenAI — used when OPENAI_API_KEY is set. Embeds with OPENAI_EMBED_MODEL
-       (defaults to text-embedding-3-small).
-    3. Gemini — used when GEMINI_API_KEY is set. Embeds with GEMINI_EMBED_MODEL
-       (defaults to models/text-embedding-004).
     """
+    Return an embeddings model using the same provider priority.
+
+    Priority:
+    1. Ollama
+    2. OpenAI
+    3. Gemini
+    """
+
     ollama_model = os.getenv("OLLAMA_MODEL")
     if ollama_model:
         from langchain_ollama import OllamaEmbeddings
@@ -86,6 +89,6 @@ def get_embeddings():
         )
 
     raise RuntimeError(
-        "No embeddings backend configured. Set one of OLLAMA_MODEL, "
-        "OPENAI_API_KEY, or GEMINI_API_KEY in .env."
+        "No embeddings backend configured. Set one of "
+        "OLLAMA_MODEL, OPENAI_API_KEY, or GEMINI_API_KEY in .env."
     )
