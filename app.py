@@ -82,10 +82,6 @@ class PipelineResult(BaseModel):
     triplets: list[ChatTriplet] = []
     matched_entities: list[str] = []
     latency_seconds: float
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-    cost_usd: float
 
 
 class ChatResponse(BaseModel):
@@ -115,6 +111,10 @@ async def upload_pdf(file: UploadFile = File(...)) -> DocInfo:
     pdf_path = UPLOAD_DIR / f"{doc_id}.pdf"
 
     if not pdf_path.exists():
+        # UPLOAD_DIR is only created once at import time, so if data/ gets
+        # deleted while the server keeps running, re-create it here rather
+        # than letting write_bytes fail with an unhandled FileNotFoundError.
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         pdf_path.write_bytes(raw)
 
     need_vector = not index_exists(doc_id)
@@ -192,10 +192,6 @@ async def _run_vector_pipeline(doc_id: str, question: str) -> PipelineResult:
         answer=result.answer,
         sources=[ChatSource(**s.__dict__) for s in result.sources],
         latency_seconds=result.latency_seconds,
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-        total_tokens=result.total_tokens,
-        cost_usd=result.cost_usd,
     )
 
 
@@ -211,10 +207,6 @@ async def _run_graph_pipeline(doc_id: str, question: str) -> PipelineResult:
         triplets=[ChatTriplet(**t.__dict__) for t in result.triplets],
         matched_entities=result.matched_entities,
         latency_seconds=result.latency_seconds,
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-        total_tokens=result.total_tokens,
-        cost_usd=result.cost_usd,
     )
 
 

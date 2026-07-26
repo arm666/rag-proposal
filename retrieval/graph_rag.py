@@ -23,7 +23,6 @@ from difflib import SequenceMatcher
 
 import networkx as nx
 import numpy as np
-from langchain_community.callbacks.manager import get_openai_callback
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from config import get_embeddings, get_llm, get_neo4j_driver, neo4j_database, neo4j_enabled
@@ -64,10 +63,6 @@ class GraphRAGResult:
     triplets: list[Triplet] = field(default_factory=list)
     matched_entities: list[str] = field(default_factory=list)
     latency_seconds: float = 0.0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-    cost_usd: float = 0.0
 
 
 def _parse_string_list(raw: str) -> list[str]:
@@ -106,25 +101,49 @@ def _char_match_score(entity_lower: str, node_lower: str) -> float:
     return SequenceMatcher(None, entity_lower, node_lower).ratio()
 
 
-def _embedding_similarity_matrix(entities: list[str], nodes: list[str]) -> np.ndarray | None:
-    """Cosine similarity between each entity and each node label, via the
-    configured embeddings backend. Returns None (falling back to
-    character-only matching) if embedding fails for any reason."""
+def _normalized_embeddings(texts: list[str]) -> np.ndarray | None:
     try:
-        vectors = np.array(get_embeddings().embed_documents(entities + nodes), dtype=np.float32)
+        vectors = np.array(get_embeddings().embed_documents(texts), dtype=np.float32)
     except Exception:
         logger.warning("graph_rag: embedding-based node matching unavailable", exc_info=True)
         return None
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return vectors / norms
 
-    entity_vecs, node_vecs = vectors[: len(entities)], vectors[len(entities) :]
-    for vecs in (entity_vecs, node_vecs):
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        vecs /= norms
+
+# doc_id -> (node labels as of last embed, their normalized vectors). Node
+# labels only change when the graph is rebuilt, so this avoids re-embedding
+# the entire node vocabulary on every single query — previously the biggest
+# hidden latency/cost source in Graph RAG retrieval, scaling with graph size.
+_node_embedding_cache: dict[str, tuple[tuple[str, ...], np.ndarray]] = {}
+
+
+def _cached_node_embeddings(doc_id: str, nodes: list[str]) -> np.ndarray | None:
+    key = tuple(nodes)
+    cached = _node_embedding_cache.get(doc_id)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    vectors = _normalized_embeddings(nodes)
+    if vectors is not None:
+        _node_embedding_cache[doc_id] = (key, vectors)
+    return vectors
+
+
+def _embedding_similarity_matrix(doc_id: str, entities: list[str], nodes: list[str]) -> np.ndarray | None:
+    """Cosine similarity between each entity and each node label, via the
+    configured embeddings backend. Returns None (falling back to
+    character-only matching) if embedding fails for any reason."""
+    node_vecs = _cached_node_embeddings(doc_id, nodes)
+    if node_vecs is None:
+        return None
+    entity_vecs = _normalized_embeddings(entities)
+    if entity_vecs is None:
+        return None
     return entity_vecs @ node_vecs.T
 
 
-def _match_nodes(nodes: list[str], entities: list[str]) -> list[str]:
+def _match_nodes(doc_id: str, nodes: list[str], entities: list[str]) -> list[str]:
     """Fuzzy-match extracted entity strings to actual graph node labels.
 
     Combines character-level overlap (good at catching casing/typo
@@ -139,20 +158,27 @@ def _match_nodes(nodes: list[str], entities: list[str]) -> list[str]:
     if not nodes or not entities:
         return []
 
-    embed_sim = _embedding_similarity_matrix(entities, nodes)
+    embed_sim = _embedding_similarity_matrix(doc_id, entities, nodes)
 
     matched = []
     for i, entity in enumerate(entities):
         entity_lower = entity.lower()
-        best_node, best_score, best_signal_ok = None, 0.0, False
+        best_node, best_score = None, -1.0
         for j, node in enumerate(nodes):
             char_score = _char_match_score(entity_lower, node.lower())
             embed_score = float(embed_sim[i, j]) if embed_sim is not None else 0.0
+            # Only candidates that clear one of the two thresholds are
+            # considered at all — previously the single highest-`combined`
+            # node across *all* candidates was picked first and only then
+            # checked against the threshold, so a node that narrowly failed
+            # both thresholds could shadow a different, lower-scoring node
+            # that actually qualified, silently dropping a valid match.
+            if char_score < NODE_MATCH_THRESHOLD and embed_score < EMBEDDING_MATCH_THRESHOLD:
+                continue
             combined = max(char_score, embed_score)
-            signal_ok = char_score >= NODE_MATCH_THRESHOLD or embed_score >= EMBEDDING_MATCH_THRESHOLD
             if combined > best_score:
-                best_node, best_score, best_signal_ok = node, combined, signal_ok
-        if best_node is not None and best_signal_ok:
+                best_node, best_score = node, combined
+        if best_node is not None:
             matched.append(best_node)
     # de-dupe, preserve order
     seen = set()
@@ -272,13 +298,20 @@ def _neo4j_bfs_collect_triplets(
     """
     max_hops = int(max_hops)
     driver = get_neo4j_driver()
+    # ORDER BY the shortest path each relationship appears on before LIMIT —
+    # without it, Neo4j's path-enumeration order (not hop-distance) decides
+    # which edges survive truncation, unlike the NetworkX BFS below, which
+    # is a real breadth-first walk and always fills the triplet budget with
+    # the closest relationships first. Keeps the two backends' retrieval
+    # behavior comparable, which matters for a thesis comparing them.
     query = f"""
         UNWIND $seeds AS seed
         MATCH (s:Entity {{docId: $doc_id, name: seed}})
         MATCH path = (s)-[:RELATION*1..{max_hops}]-(:Entity {{docId: $doc_id}})
         UNWIND relationships(path) AS rel
-        WITH DISTINCT startNode(rel) AS a, rel, endNode(rel) AS b
-        RETURN a.name AS subject, rel.type AS relation, b.name AS object, rel.page AS page
+        WITH startNode(rel) AS a, rel, endNode(rel) AS b, min(length(path)) AS hop_distance
+        RETURN DISTINCT a.name AS subject, rel.type AS relation, b.name AS object, rel.page AS page, hop_distance
+        ORDER BY hop_distance
         LIMIT $max_triplets
     """
     with driver.session(database=neo4j_database()) as session:
@@ -339,7 +372,7 @@ def answer_question(
 
     if neo4j_enabled():
         nodes = _neo4j_node_names(doc_id)
-        matched_nodes = _match_nodes(nodes, entities)
+        matched_nodes = _match_nodes(doc_id, nodes, entities)
         triplets = (
             _neo4j_bfs_collect_triplets(doc_id, matched_nodes, max_hops, max_triplets)
             if matched_nodes
@@ -351,7 +384,7 @@ def answer_question(
                 matched_nodes = sorted({t.subject for t in triplets} | {t.object for t in triplets})
     else:
         graph = load_graph(doc_id)
-        matched_nodes = _match_nodes(list(graph.nodes), entities)
+        matched_nodes = _match_nodes(doc_id, list(graph.nodes), entities)
         triplets = _bfs_collect_triplets(graph, matched_nodes, max_hops, max_triplets) if matched_nodes else []
         if not triplets:
             triplets = _keyword_fallback_triplets(graph, question, max_triplets)
@@ -362,18 +395,7 @@ def answer_question(
         SystemMessage(content=SYSTEM_PROMPT),
         HumanMessage(content=_build_prompt(question, triplets)),
     ]
-
-    prompt_tokens = completion_tokens = total_tokens = 0
-    cost_usd = 0.0
-    try:
-        with get_openai_callback() as cb:
-            response = llm.invoke(messages)
-            prompt_tokens = cb.prompt_tokens
-            completion_tokens = cb.completion_tokens
-            total_tokens = cb.total_tokens
-            cost_usd = cb.total_cost
-    except Exception:
-        response = llm.invoke(messages)
+    response = llm.invoke(messages)
 
     latency = time.perf_counter() - start
 
@@ -382,8 +404,4 @@ def answer_question(
         triplets=triplets,
         matched_entities=matched_nodes,
         latency_seconds=latency,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-        cost_usd=cost_usd,
     )

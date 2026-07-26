@@ -94,19 +94,28 @@ def _neo4j_write_triplets(doc_id: str, triplets: list[dict], failed_chunks: int)
             doc_id=doc_id,
             failed_chunks=failed_chunks,
         )
-        for triplet in triplets:
-            session.run(
-                """
-                MERGE (s:Entity {docId: $doc_id, name: $subject})
-                MERGE (o:Entity {docId: $doc_id, name: $object})
-                CREATE (s)-[r:RELATION {type: $relation, page: $page}]->(o)
-                """,
-                doc_id=doc_id,
-                subject=triplet["subject"],
-                object=triplet["object"],
-                relation=triplet["relation"],
-                page=triplet.get("page"),
-            )
+        # One UNWIND'd query instead of one session.run() per triplet — a
+        # real corpus can produce hundreds of triplets, and round-tripping
+        # each individually would reintroduce the same "sequential per-unit
+        # network call" cost this project already fixed for LLM extraction.
+        session.run(
+            """
+            UNWIND $triplets AS t
+            MERGE (s:Entity {docId: $doc_id, name: t.subject})
+            MERGE (o:Entity {docId: $doc_id, name: t.object})
+            CREATE (s)-[r:RELATION {type: t.relation, page: t.page}]->(o)
+            """,
+            doc_id=doc_id,
+            triplets=[
+                {
+                    "subject": t["subject"],
+                    "object": t["object"],
+                    "relation": t["relation"],
+                    "page": t.get("page"),
+                }
+                for t in triplets
+            ],
+        )
 
 
 def _neo4j_stats(doc_id: str) -> "GraphIndexStats":
@@ -125,10 +134,17 @@ def _neo4j_stats(doc_id: str) -> "GraphIndexStats":
 
 
 def _neo4j_index_exists(doc_id: str) -> bool:
+    # Checks for the Document marker node, not Entity count — a document
+    # whose extraction produced zero triplets (scanned PDF, every chunk
+    # failing to parse) has no Entity nodes but is still "indexed" (matches
+    # the JSON backend, which always writes graph.json regardless of triplet
+    # count). Keying this off Entity count instead would make such a
+    # document look unindexed forever, so every re-upload would silently
+    # redo the full extraction pass.
     driver = get_neo4j_driver()
     with driver.session(database=neo4j_database()) as session:
         result = session.run(
-            "MATCH (n:Entity {docId: $doc_id}) RETURN count(n) AS c LIMIT 1", doc_id=doc_id
+            "MATCH (d:Document {docId: $doc_id}) RETURN count(d) AS c LIMIT 1", doc_id=doc_id
         ).single()
     return bool(result and result["c"] > 0)
 
@@ -296,6 +312,21 @@ def build_graph_index(
                 page,
                 doc_id,
                 exc_info=True,
+            )
+            return key, page, [], True
+        # Ollama reports done_reason="length" when generation was cut off by
+        # hitting num_ctx/num_predict rather than stopping naturally — for a
+        # JSON-array response that means the output is truncated mid-object,
+        # so _parse_triplets can find no closing bracket and would otherwise
+        # silently return []. Surfacing this as a failed chunk (instead of a
+        # quiet zero-triplet "success") makes the failure visible via the
+        # failed_chunks count and lets a resumed run retry it.
+        if response.response_metadata.get("done_reason") == "length":
+            logger.warning(
+                "graph_index: LLM output truncated (hit context/token limit) for a "
+                "chunk (page=%s) of doc_id=%s — raise OLLAMA_NUM_CTX or shrink CHUNK_SIZE",
+                page,
+                doc_id,
             )
             return key, page, [], True
         return key, page, _parse_triplets(response.content), False

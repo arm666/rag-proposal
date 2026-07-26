@@ -1079,7 +1079,6 @@
     const metrics = el('div', 'metrics');
     metrics.innerHTML = `
       <span>latency <b>${result.latency_seconds.toFixed(2)}s</b></span>
-      <span>tokens <b>${result.total_tokens || '—'}</b></span>
     `;
     container.appendChild(metrics);
   }

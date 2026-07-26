@@ -59,6 +59,17 @@ def get_llm(temperature: float = 0):
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
             temperature=temperature,
             keep_alive=_ollama_keep_alive_seconds(),
+            # Without this, Ollama falls back to its runtime default context
+            # window (4096 tokens) regardless of what the model itself
+            # supports. graph_index.py's extraction chunks (6000 chars) plus
+            # a dense triplet-JSON response can blow past 4096 combined
+            # tokens, silently truncating the model's output mid-JSON — the
+            # response never errors, it just stops mid-object, so
+            # _parse_triplets can't find a closing bracket and the whole
+            # chunk quietly contributes zero triplets. 8192 covers a 6000-
+            # char chunk (~1500-2000 tokens) plus room for a large triplet
+            # array; raise OLLAMA_NUM_CTX further for bigger chunk sizes.
+            num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "8192")),
         )
 
     openai_api_key = os.getenv("OPENAI_API_KEY")

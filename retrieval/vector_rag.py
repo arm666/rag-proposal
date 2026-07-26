@@ -11,7 +11,6 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from langchain_community.callbacks.manager import get_openai_callback
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from config import get_llm
@@ -34,10 +33,6 @@ class VectorRAGResult:
     answer: str
     sources: list[Source] = field(default_factory=list)
     latency_seconds: float = 0.0
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-    cost_usd: float = 0.0
 
 
 def _build_prompt(question: str, sources: list[Source]) -> str:
@@ -70,19 +65,7 @@ def answer_question(doc_id: str, question: str, top_k: int = TOP_K) -> VectorRAG
         HumanMessage(content=_build_prompt(question, sources)),
     ]
 
-    prompt_tokens = completion_tokens = total_tokens = 0
-    cost_usd = 0.0
-    try:
-        with get_openai_callback() as cb:
-            response = llm.invoke(messages)
-            prompt_tokens = cb.prompt_tokens
-            completion_tokens = cb.completion_tokens
-            total_tokens = cb.total_tokens
-            cost_usd = cb.total_cost
-    except Exception:
-        # LangChain's OpenAI callback only instruments OpenAI-compatible
-        # calls; local/Gemini backends fall through without token/cost stats.
-        response = llm.invoke(messages)
+    response = llm.invoke(messages)
 
     latency = time.perf_counter() - start
 
@@ -90,8 +73,4 @@ def answer_question(doc_id: str, question: str, top_k: int = TOP_K) -> VectorRAG
         answer=response.content,
         sources=sources,
         latency_seconds=latency,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-        cost_usd=cost_usd,
     )
