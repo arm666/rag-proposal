@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.docstore.document import Document
 from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -26,11 +27,15 @@ def index_exists(doc_id: str) -> bool:
     return (_index_dir(doc_id) / "index.faiss").exists()
 
 
-def build_index(pdf_path: str | Path, doc_id: str) -> int:
-    """Load a PDF, chunk it page-aware, embed the chunks, and persist a FAISS
-    index under data/faiss_index/<doc_id>/. Returns the number of chunks indexed.
+def build_index(pdf_path: str | Path, doc_id: str, pages: list[Document] | None = None) -> int:
+    """Chunk a PDF page-aware, embed the chunks, and persist a FAISS index
+    under data/faiss_index/<doc_id>/. Returns the number of chunks indexed.
+
+    `pages` lets a caller that already loaded the PDF (e.g. to also build the
+    graph index) pass the pages in instead of parsing the file twice.
     """
-    pages = PyPDFLoader(str(pdf_path)).load()
+    if pages is None:
+        pages = PyPDFLoader(str(pdf_path)).load()
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -44,7 +49,17 @@ def build_index(pdf_path: str | Path, doc_id: str) -> int:
     for i, chunk in enumerate(chunks):
         chunk.metadata["chunk_id"] = i
 
-    store = FAISS.from_documents(chunks, get_embeddings())
+    # This langchain_community version always builds a plain IndexFlatL2
+    # regardless of distance_strategy (only MAX_INNER_PRODUCT gets a
+    # different index type), and _euclidean_relevance_score_fn is the one
+    # explicitly derived for L2 distance over *normalized* vectors (see its
+    # docstring) — so normalize_L2=True with the default EUCLIDEAN_DISTANCE
+    # is the combination that actually keeps the relevance score calibrated,
+    # regardless of whether the embedding model returns unit-normed vectors
+    # (OpenAI's are; many local/HF models aren't). distance_strategy=COSINE
+    # would swap in a relevance function that assumes the raw distance is
+    # already a cosine distance, which it isn't here.
+    store = FAISS.from_documents(chunks, get_embeddings(), normalize_L2=True)
 
     out_dir = _index_dir(doc_id)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -58,5 +73,8 @@ def load_index(doc_id: str) -> FAISS:
     if not (out_dir / "index.faiss").exists():
         raise FileNotFoundError(f"No FAISS index found for doc_id={doc_id!r}")
     return FAISS.load_local(
-        str(out_dir), get_embeddings(), allow_dangerous_deserialization=True
+        str(out_dir),
+        get_embeddings(),
+        allow_dangerous_deserialization=True,
+        normalize_L2=True,
     )

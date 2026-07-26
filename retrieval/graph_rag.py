@@ -11,6 +11,7 @@ retrieval, not model knowledge.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from collections import deque
@@ -18,33 +19,33 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
 import networkx as nx
+import numpy as np
 from langchain_community.callbacks.manager import get_openai_callback
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from config import get_llm
-from ingestion.graph_index import load_graph
+from config import get_embeddings, get_llm
+from ingestion.graph_index import EXTRACTION_SYSTEM_PROMPT, load_graph
+from retrieval.prompts import SYSTEM_PROMPT
+
+logger = logging.getLogger(__name__)
 
 MAX_HOPS = 2
 MAX_TRIPLETS = 20
 NODE_MATCH_THRESHOLD = 0.6
+# Below this, embedding cosine similarity is treated as "no real match" —
+# lower than NODE_MATCH_THRESHOLD because embedding similarity between
+# unrelated short strings tends to sit higher than character-overlap
+# similarity does, so the same cutoff would over-match.
+EMBEDDING_MATCH_THRESHOLD = 0.55
+# Question words shorter than this are too generic (stopword-ish) to use as
+# a keyword-search fallback signal.
+MIN_FALLBACK_KEYWORD_LEN = 4
 
 ENTITY_EXTRACTION_PROMPT = (
     "Extract the key entities (people, places, organizations, concepts, "
     "terms) mentioned in this question. Return ONLY a JSON array of strings, "
     "no prose, no markdown fences.\n\nQuestion: {question}"
 )
-
-SYSTEM_PROMPT = (
-    "You're a helpful assistant. Write naturally, like you're explaining "
-    "something to someone directly — no robotic phrasing, no unnecessary "
-    "hedging or filler, and don't preface your answer with phrases like "
-    "\"based on the context\" or \"according to the provided information\" — "
-    "just answer the question. Stick to what's actually in the context and "
-    "don't bring in outside knowledge. If the context doesn't have enough "
-    "to answer the question, just say that plainly instead of guessing or "
-    "padding the answer."
-)
-
 
 @dataclass
 class Triplet:
@@ -84,9 +85,7 @@ def _parse_string_list(raw: str) -> list[str]:
 
 def _extract_query_entities(llm, question: str) -> list[str]:
     messages = [
-        SystemMessage(
-            content="You are a precise information-extraction system that outputs only JSON."
-        ),
+        SystemMessage(content=EXTRACTION_SYSTEM_PROMPT),
         HumanMessage(content=ENTITY_EXTRACTION_PROMPT.format(question=question)),
     ]
     try:
@@ -96,25 +95,59 @@ def _extract_query_entities(llm, question: str) -> list[str]:
     return _parse_string_list(response.content)
 
 
+def _char_match_score(entity_lower: str, node_lower: str) -> float:
+    if entity_lower == node_lower:
+        return 1.0
+    if entity_lower in node_lower or node_lower in entity_lower:
+        return 0.85
+    return SequenceMatcher(None, entity_lower, node_lower).ratio()
+
+
+def _embedding_similarity_matrix(entities: list[str], nodes: list[str]) -> np.ndarray | None:
+    """Cosine similarity between each entity and each node label, via the
+    configured embeddings backend. Returns None (falling back to
+    character-only matching) if embedding fails for any reason."""
+    try:
+        vectors = np.array(get_embeddings().embed_documents(entities + nodes), dtype=np.float32)
+    except Exception:
+        logger.warning("graph_rag: embedding-based node matching unavailable", exc_info=True)
+        return None
+
+    entity_vecs, node_vecs = vectors[: len(entities)], vectors[len(entities) :]
+    for vecs in (entity_vecs, node_vecs):
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        vecs /= norms
+    return entity_vecs @ node_vecs.T
+
+
 def _match_nodes(graph: nx.MultiDiGraph, entities: list[str]) -> list[str]:
-    """Fuzzy-match extracted entity strings to actual graph node labels."""
+    """Fuzzy-match extracted entity strings to actual graph node labels.
+
+    Combines character-level overlap (good at catching casing/typo
+    variants) with embedding cosine similarity (good at catching
+    paraphrases and partial names that share no characters in common, e.g.
+    "the developer" vs. a node like "Aashish Rana Magar") — pure
+    character matching alone missed most non-verbatim mentions.
+    """
     nodes = list(graph.nodes)
+    if not nodes or not entities:
+        return []
+
+    embed_sim = _embedding_similarity_matrix(entities, nodes)
+
     matched = []
-    for entity in entities:
-        best_node, best_score = None, 0.0
+    for i, entity in enumerate(entities):
         entity_lower = entity.lower()
-        for node in nodes:
-            node_lower = node.lower()
-            if entity_lower == node_lower:
-                best_node, best_score = node, 1.0
-                break
-            if entity_lower in node_lower or node_lower in entity_lower:
-                score = 0.85
-            else:
-                score = SequenceMatcher(None, entity_lower, node_lower).ratio()
-            if score > best_score:
-                best_node, best_score = node, score
-        if best_node is not None and best_score >= NODE_MATCH_THRESHOLD:
+        best_node, best_score, best_signal_ok = None, 0.0, False
+        for j, node in enumerate(nodes):
+            char_score = _char_match_score(entity_lower, node.lower())
+            embed_score = float(embed_sim[i, j]) if embed_sim is not None else 0.0
+            combined = max(char_score, embed_score)
+            signal_ok = char_score >= NODE_MATCH_THRESHOLD or embed_score >= EMBEDDING_MATCH_THRESHOLD
+            if combined > best_score:
+                best_node, best_score, best_signal_ok = node, combined, signal_ok
+        if best_node is not None and best_signal_ok:
             matched.append(best_node)
     # de-dupe, preserve order
     seen = set()
@@ -124,6 +157,39 @@ def _match_nodes(graph: nx.MultiDiGraph, entities: list[str]) -> list[str]:
             seen.add(node)
             unique.append(node)
     return unique
+
+
+def _keyword_fallback_triplets(
+    graph: nx.MultiDiGraph, question: str, max_triplets: int
+) -> list[Triplet]:
+    """When entity-based matching finds nothing to traverse from, fall back
+    to a plain keyword search over every triplet's subject/relation/object
+    text. Recovers cases where the LLM's extracted query entities don't map
+    onto any graph node at all — e.g. a question that doesn't name an
+    entity explicitly — instead of silently returning an empty context even
+    though the graph has relevant relationships.
+    """
+    keywords = {
+        w for w in re.findall(r"[a-zA-Z0-9]+", question.lower()) if len(w) >= MIN_FALLBACK_KEYWORD_LEN
+    }
+    if not keywords:
+        return []
+
+    triplets: list[Triplet] = []
+    seen_edges: set[tuple] = set()
+    for subj, obj, data in graph.edges(data=True):
+        relation = data.get("relation", "related_to")
+        haystack = f"{subj} {relation} {obj}".lower()
+        if not any(kw in haystack for kw in keywords):
+            continue
+        edge_key = (subj, relation, obj)
+        if edge_key in seen_edges:
+            continue
+        seen_edges.add(edge_key)
+        triplets.append(Triplet(subject=subj, relation=relation, object=obj, page=data.get("page")))
+        if len(triplets) >= max_triplets:
+            break
+    return triplets
 
 
 def _bfs_collect_triplets(
@@ -195,7 +261,12 @@ def answer_question(
 
     entities = _extract_query_entities(llm, question)
     matched_nodes = _match_nodes(graph, entities)
-    triplets = _bfs_collect_triplets(graph, matched_nodes, max_hops, max_triplets)
+    triplets = _bfs_collect_triplets(graph, matched_nodes, max_hops, max_triplets) if matched_nodes else []
+
+    if not triplets:
+        triplets = _keyword_fallback_triplets(graph, question, max_triplets)
+        if triplets and not matched_nodes:
+            matched_nodes = sorted({t.subject for t in triplets} | {t.object for t in triplets})
 
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),

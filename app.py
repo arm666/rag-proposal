@@ -21,6 +21,7 @@ what's already indexed without it having to re-upload anything.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import shutil
 from pathlib import Path
@@ -30,11 +31,12 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from langchain_community.document_loaders import PyPDFLoader
 from pydantic import BaseModel
 
 from db import clear_documents, list_documents, upsert_document
-from ingestion.graph_index import build_graph_index, graph_index_exists
-from ingestion.vector_index import build_index, index_exists
+from ingestion.graph_index import build_graph_index, graph_index_exists, load_graph_stats
+from ingestion.vector_index import build_index, index_exists, load_index
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "data" / "uploads"
@@ -96,6 +98,7 @@ class DocInfo(BaseModel):
     filename: str
     chunks: int
     triplets: int
+    failed_chunks: int = 0
 
 
 @app.post("/api/upload", response_model=DocInfo)
@@ -113,29 +116,46 @@ async def upload_pdf(file: UploadFile = File(...)) -> DocInfo:
     if not pdf_path.exists():
         pdf_path.write_bytes(raw)
 
-    if not index_exists(doc_id):
+    need_vector = not index_exists(doc_id)
+    need_graph = not graph_index_exists(doc_id)
+
+    # Both build steps are blocking (PDF parsing, embedding, LLM calls), so
+    # every awaited call below runs on a worker thread rather than the
+    # asyncio event loop — otherwise one upload would freeze every other
+    # request the server is handling. Parsing the PDF once and handing the
+    # same pages to both indexers also avoids loading it twice.
+    pages = None
+    if need_vector or need_graph:
+        pages = await asyncio.to_thread(lambda: PyPDFLoader(str(pdf_path)).load())
+
+    async def build_vector() -> int:
+        if not need_vector:
+            return (await asyncio.to_thread(load_index, doc_id)).index.ntotal
         try:
-            chunks = build_index(pdf_path, doc_id)
+            return await asyncio.to_thread(build_index, pdf_path, doc_id, pages)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Failed to build vector index: {exc}") from exc
-    else:
-        from ingestion.vector_index import load_index
 
-        chunks = load_index(doc_id).index.ntotal
-
-    if not graph_index_exists(doc_id):
+    async def build_graph():
+        if not need_graph:
+            return await asyncio.to_thread(load_graph_stats, doc_id)
         try:
-            triplets = build_graph_index(pdf_path, doc_id)
+            return await asyncio.to_thread(build_graph_index, pdf_path, doc_id, pages)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Failed to build graph index: {exc}") from exc
-    else:
-        import json
 
-        graph_file = BASE_DIR / "data" / "graph_index" / doc_id / "graph.json"
-        triplets = len(json.loads(graph_file.read_text(encoding="utf-8")).get("triplets", []))
+    # Vector and graph indexing don't depend on each other's output, so run
+    # them concurrently instead of one after the other.
+    chunks, graph_stats = await asyncio.gather(build_vector(), build_graph())
 
-    upsert_document(doc_id, file.filename, chunks, triplets)
-    return DocInfo(doc_id=doc_id, filename=file.filename, chunks=chunks, triplets=triplets)
+    upsert_document(doc_id, file.filename, chunks, graph_stats.triplets, graph_stats.failed_chunks)
+    return DocInfo(
+        doc_id=doc_id,
+        filename=file.filename,
+        chunks=chunks,
+        triplets=graph_stats.triplets,
+        failed_chunks=graph_stats.failed_chunks,
+    )
 
 
 @app.get("/api/docs", response_model=list[DocInfo])
@@ -156,52 +176,67 @@ async def clear_docs() -> dict[str, bool]:
     return {"cleared": True}
 
 
+async def _run_vector_pipeline(doc_id: str, question: str) -> PipelineResult:
+    from retrieval.vector_rag import answer_question as vector_answer
+
+    try:
+        result = await asyncio.to_thread(vector_answer, doc_id, question)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Vector RAG failed: {exc}") from exc
+    return PipelineResult(
+        answer=result.answer,
+        sources=[ChatSource(**s.__dict__) for s in result.sources],
+        latency_seconds=result.latency_seconds,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        total_tokens=result.total_tokens,
+        cost_usd=result.cost_usd,
+    )
+
+
+async def _run_graph_pipeline(doc_id: str, question: str) -> PipelineResult:
+    from retrieval.graph_rag import answer_question as graph_answer
+
+    try:
+        result = await asyncio.to_thread(graph_answer, doc_id, question)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Graph RAG failed: {exc}") from exc
+    return PipelineResult(
+        answer=result.answer,
+        triplets=[ChatTriplet(**t.__dict__) for t in result.triplets],
+        matched_entities=result.matched_entities,
+        latency_seconds=result.latency_seconds,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        total_tokens=result.total_tokens,
+        cost_usd=result.cost_usd,
+    )
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="Question must not be empty.")
     if not index_exists(req.doc_id):
         raise HTTPException(status_code=404, detail="Unknown doc_id — upload the PDF first.")
+    if req.mode in ("graph", "both") and not graph_index_exists(req.doc_id):
+        raise HTTPException(status_code=404, detail="No graph index for this document — re-upload it.")
 
-    vector_result = None
-    graph_result = None
-
+    # Both pipelines are blocking (embedding/LLM calls), so they're offloaded
+    # to worker threads rather than run directly on the event loop — and,
+    # in "both" mode, run concurrently instead of one after the other since
+    # they're independent of each other.
+    coros = []
     if req.mode in ("vector", "both"):
-        from retrieval.vector_rag import answer_question as vector_answer
-
-        try:
-            result = vector_answer(req.doc_id, req.question)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Vector RAG failed: {exc}") from exc
-        vector_result = PipelineResult(
-            answer=result.answer,
-            sources=[ChatSource(**s.__dict__) for s in result.sources],
-            latency_seconds=result.latency_seconds,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-            total_tokens=result.total_tokens,
-            cost_usd=result.cost_usd,
-        )
-
+        coros.append(_run_vector_pipeline(req.doc_id, req.question))
     if req.mode in ("graph", "both"):
-        if not graph_index_exists(req.doc_id):
-            raise HTTPException(status_code=404, detail="No graph index for this document — re-upload it.")
-        from retrieval.graph_rag import answer_question as graph_answer
+        coros.append(_run_graph_pipeline(req.doc_id, req.question))
 
-        try:
-            result = graph_answer(req.doc_id, req.question)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Graph RAG failed: {exc}") from exc
-        graph_result = PipelineResult(
-            answer=result.answer,
-            triplets=[ChatTriplet(**t.__dict__) for t in result.triplets],
-            matched_entities=result.matched_entities,
-            latency_seconds=result.latency_seconds,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-            total_tokens=result.total_tokens,
-            cost_usd=result.cost_usd,
-        )
+    results = await asyncio.gather(*coros)
+
+    results_iter = iter(results)
+    vector_result = next(results_iter) if req.mode in ("vector", "both") else None
+    graph_result = next(results_iter) if req.mode in ("graph", "both") else None
 
     return ChatResponse(mode=req.mode, vector=vector_result, graph=graph_result)
 

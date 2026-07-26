@@ -5,6 +5,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _ollama_keep_alive_seconds() -> int:
+    """OLLAMA_KEEP_ALIVE is documented in .env as seconds (e.g. "1800" for
+    30 minutes, "-1" to keep the model resident indefinitely).
+    OllamaEmbeddings only accepts an int number of seconds for keep_alive
+    (unlike ChatOllama, which also accepts duration strings like "30m"), so
+    both use the same int value here for consistency."""
+    return int(os.getenv("OLLAMA_KEEP_ALIVE", "1800"))
+
+
 def get_llm(temperature: float = 0):
     """
     Return a chat LLM using the first available backend.
@@ -23,6 +32,7 @@ def get_llm(temperature: float = 0):
             model=ollama_model,
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
             temperature=temperature,
+            keep_alive=_ollama_keep_alive_seconds(),
         )
 
     openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -68,6 +78,7 @@ def get_embeddings():
         return OllamaEmbeddings(
             model=os.getenv("OLLAMA_EMBED_MODEL", "embeddinggemma:latest"),
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+            keep_alive=_ollama_keep_alive_seconds(),
         )
 
     openai_api_key = os.getenv("OPENAI_API_KEY")

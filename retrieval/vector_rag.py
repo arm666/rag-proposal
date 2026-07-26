@@ -16,19 +16,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from config import get_llm
 from ingestion.vector_index import load_index
+from retrieval.prompts import SYSTEM_PROMPT
 
-TOP_K = 3
-
-SYSTEM_PROMPT = (
-    "You're a helpful assistant. Write naturally, like you're explaining "
-    "something to someone directly — no robotic phrasing, no unnecessary "
-    "hedging or filler, and don't preface your answer with phrases like "
-    "\"based on the context\" or \"according to the provided information\" — "
-    "just answer the question. Stick to what's actually in the context and "
-    "don't bring in outside knowledge. If the context doesn't have enough "
-    "to answer the question, just say that plainly instead of guessing or "
-    "padding the answer."
-)
+TOP_K = 6
 
 
 @dataclass

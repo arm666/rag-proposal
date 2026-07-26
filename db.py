@@ -25,34 +25,45 @@ def _connect() -> sqlite3.Connection:
             filename TEXT NOT NULL,
             chunks INTEGER NOT NULL,
             triplets INTEGER NOT NULL,
+            failed_chunks INTEGER NOT NULL DEFAULT 0,
             uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
         """
     )
+    try:
+        conn.execute("ALTER TABLE documents ADD COLUMN failed_chunks INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists (pre-existing db from before this field was added)
     return conn
 
 
-def upsert_document(doc_id: str, filename: str, chunks: int, triplets: int) -> None:
+def upsert_document(
+    doc_id: str, filename: str, chunks: int, triplets: int, failed_chunks: int = 0
+) -> None:
     with _connect() as conn:
         conn.execute(
             """
-            INSERT INTO documents (doc_id, filename, chunks, triplets)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO documents (doc_id, filename, chunks, triplets, failed_chunks)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(doc_id) DO UPDATE SET
                 filename = excluded.filename,
                 chunks = excluded.chunks,
-                triplets = excluded.triplets
+                triplets = excluded.triplets,
+                failed_chunks = excluded.failed_chunks
             """,
-            (doc_id, filename, chunks, triplets),
+            (doc_id, filename, chunks, triplets, failed_chunks),
         )
 
 
 def list_documents() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT doc_id, filename, chunks, triplets FROM documents ORDER BY uploaded_at ASC"
+            "SELECT doc_id, filename, chunks, triplets, failed_chunks FROM documents ORDER BY uploaded_at ASC"
         ).fetchall()
-    return [{"doc_id": r[0], "filename": r[1], "chunks": r[2], "triplets": r[3]} for r in rows]
+    return [
+        {"doc_id": r[0], "filename": r[1], "chunks": r[2], "triplets": r[3], "failed_chunks": r[4]}
+        for r in rows
+    ]
 
 
 def clear_documents() -> None:

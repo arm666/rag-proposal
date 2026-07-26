@@ -11,9 +11,12 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import networkx as nx
+from langchain_community.docstore.document import Document
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -42,6 +45,11 @@ _DEFAULT_EXTRACTION_WORKERS = "1" if os.getenv("OLLAMA_MODEL") else "4"
 EXTRACTION_WORKERS = int(
     os.getenv("GRAPH_EXTRACTION_WORKERS", _DEFAULT_EXTRACTION_WORKERS)
 )
+
+# Shared with retrieval/graph_rag.py's query-entity extraction — same task
+# (structured-JSON information extraction), so both use the same system
+# message rather than maintaining two copies of the same instruction.
+EXTRACTION_SYSTEM_PROMPT = "You are a precise information-extraction system that outputs only JSON."
 
 EXTRACTION_PROMPT = (
     "Extract entity-relationship triplets from the text below for a knowledge "
@@ -105,18 +113,85 @@ def _load_checkpoint(checkpoint_file: Path) -> dict[str, list[dict]]:
         return {}
 
 
-def build_graph_index(pdf_path: str | Path, doc_id: str) -> int:
-    """Load a PDF, extract entity-relationship triplets chunk-by-chunk via the
-    LLM, build a NetworkX directed multigraph, and persist it as
-    data/graph_index/<doc_id>/graph.json. Returns the number of triplets extracted.
+# Entity labels whose lowercase form matches exactly, or whose character-level
+# similarity is at or above this threshold, are merged into one canonical
+# node. Deliberately higher than graph_rag.py's query-time match threshold
+# (0.6) — a false merge here silently conflates two distinct real-world
+# entities, which is worse than the fragmentation it's meant to fix, so this
+# only catches near-identical surface forms (casing, punctuation, whitespace).
+CANONICALIZATION_THRESHOLD = 0.92
+
+
+def _canonicalize_triplets(triplets: list[dict]) -> list[dict]:
+    """Merge near-duplicate entity labels into one canonical surface form per
+    cluster. Each chunk is extracted independently, so the same real-world
+    entity can come back as slightly different strings from different
+    chunks (case, punctuation, minor wording) — left alone, that fragments
+    the graph into disconnected nodes for what should be one entity, which
+    breaks BFS traversal at query time. This is a cheap string-similarity
+    pass (no extra LLM calls), so it doesn't add to ingestion latency.
+    """
+    labels: list[str] = []
+    seen: set[str] = set()
+    for t in triplets:
+        for label in (t["subject"], t["object"]):
+            if label not in seen:
+                seen.add(label)
+                labels.append(label)
+
+    canonical_for: dict[str, str] = {}
+    representatives: list[str] = []
+
+    for label in labels:
+        label_lower = label.lower()
+        match = None
+        for rep in representatives:
+            rep_lower = rep.lower()
+            if label_lower == rep_lower:
+                match = rep
+                break
+            if SequenceMatcher(None, label_lower, rep_lower).ratio() >= CANONICALIZATION_THRESHOLD:
+                match = rep
+                break
+        if match is None:
+            representatives.append(label)
+            canonical_for[label] = label
+        else:
+            canonical_for[label] = match
+
+    return [
+        dict(t, subject=canonical_for[t["subject"]], object=canonical_for[t["object"]])
+        for t in triplets
+    ]
+
+
+@dataclass
+class GraphIndexStats:
+    triplets: int
+    failed_chunks: int
+
+
+def build_graph_index(
+    pdf_path: str | Path, doc_id: str, pages: list[Document] | None = None
+) -> GraphIndexStats:
+    """Extract entity-relationship triplets chunk-by-chunk via the LLM, merge
+    near-duplicate entity labels, build a NetworkX directed multigraph, and
+    persist it as data/graph_index/<doc_id>/graph.json. Returns the number of
+    triplets extracted and how many chunks failed extraction.
+
+    `pages` lets a caller that already loaded the PDF (e.g. to also build the
+    vector index) pass the pages in instead of parsing the file twice.
 
     Progress is checkpointed per-chunk to a sidecar file so an interrupted
     run (crash, rate limit, manual cancel) can resume instead of redoing
     every chunk — the dominant cost of indexing is LLM round-trip latency,
     and a multi-hour job losing all progress on a transient failure is
-    expensive in practice.
+    expensive in practice. Chunks that fail extraction are deliberately left
+    out of the checkpoint so a resumed run retries them instead of
+    permanently accepting the failure as "done with zero triplets".
     """
-    pages = PyPDFLoader(str(pdf_path)).load()
+    if pages is None:
+        pages = PyPDFLoader(str(pdf_path)).load()
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -134,16 +209,14 @@ def build_graph_index(pdf_path: str | Path, doc_id: str) -> int:
 
     llm = get_llm(temperature=0)
 
-    def extract_chunk(chunk) -> tuple[str, int | None, list[dict]]:
+    def extract_chunk(chunk) -> tuple[str, int | None, list[dict], bool]:
         key = _chunk_key(chunk)
         page = chunk.metadata.get("page")
         if key in checkpoint:
-            return key, page, checkpoint[key]
+            return key, page, checkpoint[key], False
 
         messages = [
-            SystemMessage(
-                content="You are a precise information-extraction system that outputs only JSON."
-            ),
+            SystemMessage(content=EXTRACTION_SYSTEM_PROMPT),
             HumanMessage(content=EXTRACTION_PROMPT.format(text=chunk.page_content)),
         ]
         try:
@@ -155,11 +228,11 @@ def build_graph_index(pdf_path: str | Path, doc_id: str) -> int:
                 doc_id,
                 exc_info=True,
             )
-            return key, page, []
-        return key, page, _parse_triplets(response.content)
+            return key, page, [], True
+        return key, page, _parse_triplets(response.content), False
 
-    graph = nx.MultiDiGraph()
     all_triplets: list[dict] = []
+    failed_chunks = 0
     pending_chunks = [c for c in chunks if _chunk_key(c) not in checkpoint]
     if pending_chunks:
         logger.info(
@@ -175,28 +248,47 @@ def build_graph_index(pdf_path: str | Path, doc_id: str) -> int:
     # documents, since each write serializes everything seen so far.
     CHECKPOINT_INTERVAL = 5
     with ThreadPoolExecutor(max_workers=EXTRACTION_WORKERS) as pool:
-        for i, (key, page, triplets) in enumerate(pool.map(extract_chunk, chunks), 1):
-            checkpoint[key] = triplets
+        for i, (key, page, triplets, failed) in enumerate(pool.map(extract_chunk, chunks), 1):
+            if failed:
+                failed_chunks += 1
+            else:
+                checkpoint[key] = triplets
             if i % CHECKPOINT_INTERVAL == 0 or i == len(chunks):
                 checkpoint_file.write_text(json.dumps(checkpoint), encoding="utf-8")
             for triplet in triplets:
-                triplet = dict(triplet, page=page)
-                all_triplets.append(triplet)
-                graph.add_node(triplet["subject"])
-                graph.add_node(triplet["object"])
-                graph.add_edge(
-                    triplet["subject"],
-                    triplet["object"],
-                    relation=triplet["relation"],
-                    page=page,
-                )
+                all_triplets.append(dict(triplet, page=page))
+
+    all_triplets = _canonicalize_triplets(all_triplets)
+
+    graph = nx.MultiDiGraph()
+    for triplet in all_triplets:
+        graph.add_node(triplet["subject"])
+        graph.add_node(triplet["object"])
+        graph.add_edge(
+            triplet["subject"],
+            triplet["object"],
+            relation=triplet["relation"],
+            page=triplet.get("page"),
+        )
 
     (out_dir / "graph.json").write_text(
-        json.dumps({"triplets": all_triplets}, indent=2), encoding="utf-8"
+        json.dumps({"triplets": all_triplets, "failed_chunks": failed_chunks}, indent=2),
+        encoding="utf-8",
     )
     checkpoint_file.unlink(missing_ok=True)
 
-    return len(all_triplets)
+    return GraphIndexStats(triplets=len(all_triplets), failed_chunks=failed_chunks)
+
+
+def load_graph_stats(doc_id: str) -> GraphIndexStats:
+    """Read triplet/failed-chunk counts for an already-built graph index,
+    without loading it into a full NetworkX graph."""
+    graph_file = _graph_dir(doc_id) / "graph.json"
+    data = json.loads(graph_file.read_text(encoding="utf-8"))
+    return GraphIndexStats(
+        triplets=len(data.get("triplets", [])),
+        failed_chunks=data.get("failed_chunks", 0),
+    )
 
 
 def load_graph(doc_id: str) -> nx.MultiDiGraph:
