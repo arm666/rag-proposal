@@ -34,6 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from langchain_community.document_loaders import PyPDFLoader
 from pydantic import BaseModel
 
+from config import get_neo4j_driver, neo4j_database, neo4j_enabled
 from db import clear_documents, list_documents, upsert_document
 from ingestion.graph_index import build_graph_index, graph_index_exists, load_graph_stats
 from ingestion.vector_index import build_index, index_exists, load_index
@@ -172,6 +173,10 @@ async def clear_docs() -> dict[str, bool]:
         if directory.exists():
             shutil.rmtree(directory)
         directory.mkdir(parents=True, exist_ok=True)
+    if neo4j_enabled():
+        driver = get_neo4j_driver()
+        with driver.session(database=neo4j_database()) as session:
+            await asyncio.to_thread(session.run, "MATCH (n) DETACH DELETE n")
     clear_documents()
     return {"cleared": True}
 

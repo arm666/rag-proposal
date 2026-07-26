@@ -1,7 +1,11 @@
 """Stage 1 (Ingestion) of the Graph RAG pipeline: extract entity-relationship
-triplets from a PDF with the LLM backbone, build a NetworkX knowledge graph,
-and persist it as JSON so retrieval always runs against a stable, pre-built
-representation (thesis §3.3.1)."""
+triplets from a PDF with the LLM backbone, then persist them so retrieval
+always runs against a stable, pre-built representation (thesis §3.3.1).
+
+Storage backend: Neo4j when NEO4J_URI is configured (see
+config.neo4j_enabled()), otherwise a NetworkX graph persisted as JSON at
+data/graph_index/<doc_id>/graph.json.
+"""
 
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-from config import get_llm
+from config import get_llm, get_neo4j_driver, neo4j_database, neo4j_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +71,71 @@ def _graph_dir(doc_id: str) -> Path:
     return GRAPH_ROOT / doc_id
 
 
+# Entities are stored as generic `Entity` nodes scoped by a `docId` property
+# (so multiple documents can share one Neo4j instance/database without their
+# graphs merging), rather than one Neo4j label per document. Relationships
+# use a single `RELATION` type with the actual LLM-extracted relation text
+# stored as a `type` property — Cypher relationship *types* must be static
+# in a query (dynamic types need the APOC plugin, which isn't assumed to be
+# installed), so a static type + dynamic property is the portable choice.
+def _neo4j_write_triplets(doc_id: str, triplets: list[dict], failed_chunks: int) -> None:
+    driver = get_neo4j_driver()
+    with driver.session(database=neo4j_database()) as session:
+        session.run(
+            "CREATE CONSTRAINT entity_doc_name IF NOT EXISTS "
+            "FOR (e:Entity) REQUIRE (e.docId, e.name) IS UNIQUE"
+        )
+        # Replace any previous subgraph for this doc_id so a rebuild doesn't
+        # leave stale nodes/relationships behind.
+        session.run("MATCH (n:Entity {docId: $doc_id}) DETACH DELETE n", doc_id=doc_id)
+        session.run("MATCH (d:Document {docId: $doc_id}) DELETE d", doc_id=doc_id)
+        session.run(
+            "MERGE (d:Document {docId: $doc_id}) SET d.failedChunks = $failed_chunks",
+            doc_id=doc_id,
+            failed_chunks=failed_chunks,
+        )
+        for triplet in triplets:
+            session.run(
+                """
+                MERGE (s:Entity {docId: $doc_id, name: $subject})
+                MERGE (o:Entity {docId: $doc_id, name: $object})
+                CREATE (s)-[r:RELATION {type: $relation, page: $page}]->(o)
+                """,
+                doc_id=doc_id,
+                subject=triplet["subject"],
+                object=triplet["object"],
+                relation=triplet["relation"],
+                page=triplet.get("page"),
+            )
+
+
+def _neo4j_stats(doc_id: str) -> "GraphIndexStats":
+    driver = get_neo4j_driver()
+    with driver.session(database=neo4j_database()) as session:
+        triplets = session.run(
+            "MATCH (:Entity {docId: $doc_id})-[r:RELATION]->(:Entity {docId: $doc_id}) "
+            "RETURN count(r) AS c",
+            doc_id=doc_id,
+        ).single()["c"]
+        doc = session.run(
+            "MATCH (d:Document {docId: $doc_id}) RETURN d.failedChunks AS f",
+            doc_id=doc_id,
+        ).single()
+    return GraphIndexStats(triplets=triplets, failed_chunks=(doc["f"] if doc else 0) or 0)
+
+
+def _neo4j_index_exists(doc_id: str) -> bool:
+    driver = get_neo4j_driver()
+    with driver.session(database=neo4j_database()) as session:
+        result = session.run(
+            "MATCH (n:Entity {docId: $doc_id}) RETURN count(n) AS c LIMIT 1", doc_id=doc_id
+        ).single()
+    return bool(result and result["c"] > 0)
+
+
 def graph_index_exists(doc_id: str) -> bool:
+    if neo4j_enabled():
+        return _neo4j_index_exists(doc_id)
     return (_graph_dir(doc_id) / "graph.json").exists()
 
 
@@ -175,9 +243,10 @@ def build_graph_index(
     pdf_path: str | Path, doc_id: str, pages: list[Document] | None = None
 ) -> GraphIndexStats:
     """Extract entity-relationship triplets chunk-by-chunk via the LLM, merge
-    near-duplicate entity labels, build a NetworkX directed multigraph, and
-    persist it as data/graph_index/<doc_id>/graph.json. Returns the number of
-    triplets extracted and how many chunks failed extraction.
+    near-duplicate entity labels, and persist them (to Neo4j, or to
+    data/graph_index/<doc_id>/graph.json — see config.neo4j_enabled()).
+    Returns the number of triplets extracted and how many chunks failed
+    extraction.
 
     `pages` lets a caller that already loaded the PDF (e.g. to also build the
     vector index) pass the pages in instead of parsing the file twice.
@@ -260,21 +329,13 @@ def build_graph_index(
 
     all_triplets = _canonicalize_triplets(all_triplets)
 
-    graph = nx.MultiDiGraph()
-    for triplet in all_triplets:
-        graph.add_node(triplet["subject"])
-        graph.add_node(triplet["object"])
-        graph.add_edge(
-            triplet["subject"],
-            triplet["object"],
-            relation=triplet["relation"],
-            page=triplet.get("page"),
+    if neo4j_enabled():
+        _neo4j_write_triplets(doc_id, all_triplets, failed_chunks)
+    else:
+        (out_dir / "graph.json").write_text(
+            json.dumps({"triplets": all_triplets, "failed_chunks": failed_chunks}, indent=2),
+            encoding="utf-8",
         )
-
-    (out_dir / "graph.json").write_text(
-        json.dumps({"triplets": all_triplets, "failed_chunks": failed_chunks}, indent=2),
-        encoding="utf-8",
-    )
     checkpoint_file.unlink(missing_ok=True)
 
     return GraphIndexStats(triplets=len(all_triplets), failed_chunks=failed_chunks)
@@ -283,6 +344,8 @@ def build_graph_index(
 def load_graph_stats(doc_id: str) -> GraphIndexStats:
     """Read triplet/failed-chunk counts for an already-built graph index,
     without loading it into a full NetworkX graph."""
+    if neo4j_enabled():
+        return _neo4j_stats(doc_id)
     graph_file = _graph_dir(doc_id) / "graph.json"
     data = json.loads(graph_file.read_text(encoding="utf-8"))
     return GraphIndexStats(

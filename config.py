@@ -1,8 +1,34 @@
+import functools
 import os
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def neo4j_enabled() -> bool:
+    """Graph RAG storage backend: Neo4j when NEO4J_URI is set, otherwise the
+    local NetworkX+JSON pipeline (see ingestion/graph_index.py and
+    retrieval/graph_rag.py) — same provider-selection pattern as get_llm()."""
+    return bool(os.getenv("NEO4J_URI"))
+
+
+def neo4j_database() -> str:
+    return os.getenv("NEO4J_DATABASE", "neo4j")
+
+
+@functools.lru_cache(maxsize=1)
+def get_neo4j_driver():
+    """Return a process-wide singleton Neo4j driver. The driver manages its
+    own connection pool and is meant to be created once and reused (unlike
+    get_llm()/get_embeddings(), which are cheap to reconstruct per call) —
+    only call this when neo4j_enabled() is True."""
+    from neo4j import GraphDatabase
+
+    uri = os.getenv("NEO4J_URI")
+    user = os.getenv("NEO4J_USERNAME", "neo4j")
+    password = os.getenv("NEO4J_PASSWORD")
+    return GraphDatabase.driver(uri, auth=(user, password))
 
 
 def _ollama_keep_alive_seconds() -> int:

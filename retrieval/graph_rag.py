@@ -2,10 +2,13 @@
 described in the thesis proposal §3.3.2-3.3.3.
 
 Retrieval: extract query entities via the LLM, fuzzy-match them to graph
-nodes, then run BFS traversal up to 2 hops to collect up to 20 relationship
-triplets. Generation: same LLM backbone, temperature 0, context-only prompt —
-identical constraint to the Vector RAG pipeline so output quality depends on
-retrieval, not model knowledge.
+nodes, then traverse up to 2 hops to collect up to 20 relationship triplets.
+The graph itself lives in Neo4j when NEO4J_URI is configured (traversal runs
+as a Cypher query), otherwise in an in-memory NetworkX graph loaded from
+data/graph_index/<doc_id>/graph.json (traversal is a Python BFS) — see
+config.neo4j_enabled(). Generation: same LLM backbone, temperature 0,
+context-only prompt — identical constraint to the Vector RAG pipeline so
+output quality depends on retrieval, not model knowledge.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ import numpy as np
 from langchain_community.callbacks.manager import get_openai_callback
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from config import get_embeddings, get_llm
+from config import get_embeddings, get_llm, get_neo4j_driver, neo4j_database, neo4j_enabled
 from ingestion.graph_index import EXTRACTION_SYSTEM_PROMPT, load_graph
 from retrieval.prompts import SYSTEM_PROMPT
 
@@ -121,7 +124,7 @@ def _embedding_similarity_matrix(entities: list[str], nodes: list[str]) -> np.nd
     return entity_vecs @ node_vecs.T
 
 
-def _match_nodes(graph: nx.MultiDiGraph, entities: list[str]) -> list[str]:
+def _match_nodes(nodes: list[str], entities: list[str]) -> list[str]:
     """Fuzzy-match extracted entity strings to actual graph node labels.
 
     Combines character-level overlap (good at catching casing/typo
@@ -129,8 +132,10 @@ def _match_nodes(graph: nx.MultiDiGraph, entities: list[str]) -> list[str]:
     paraphrases and partial names that share no characters in common, e.g.
     "the developer" vs. a node like "Aashish Rana Magar") — pure
     character matching alone missed most non-verbatim mentions.
+
+    Takes a plain node-label list rather than a graph object so both the
+    NetworkX and Neo4j backends can share this exact matching logic.
     """
-    nodes = list(graph.nodes)
     if not nodes or not entities:
         return []
 
@@ -236,6 +241,79 @@ def _bfs_collect_triplets(
     return triplets[:max_triplets]
 
 
+# --- Neo4j-backed retrieval -------------------------------------------------
+# When NEO4J_URI is configured (see config.neo4j_enabled), the graph lives in
+# Neo4j instead of an in-memory NetworkX graph loaded from JSON. Entity
+# matching (_match_nodes above) is identical either way — only where the
+# candidate node list comes from, and how traversal/keyword search run,
+# differ. Traversal and keyword search are pushed down into Cypher instead
+# of walking edges in a Python loop, which is the actual point of using a
+# real graph database instead of NetworkX+JSON.
+
+
+def _neo4j_node_names(doc_id: str) -> list[str]:
+    driver = get_neo4j_driver()
+    with driver.session(database=neo4j_database()) as session:
+        result = session.run("MATCH (n:Entity {docId: $doc_id}) RETURN n.name AS name", doc_id=doc_id)
+        return [record["name"] for record in result]
+
+
+def _neo4j_bfs_collect_triplets(
+    doc_id: str, seed_nodes: list[str], max_hops: int, max_triplets: int
+) -> list[Triplet]:
+    """Cypher equivalent of _bfs_collect_triplets: variable-length path
+    traversal (both directions) from the seed nodes, up to max_hops away.
+
+    Neo4j doesn't allow parameterizing a variable-length relationship
+    pattern's hop bound (`*1..N`) — it must be a literal in the query text.
+    max_hops is always one of this module's own int constants/defaults
+    (never user input), so interpolating it is safe; doc_id and seed_nodes
+    stay proper query parameters.
+    """
+    max_hops = int(max_hops)
+    driver = get_neo4j_driver()
+    query = f"""
+        UNWIND $seeds AS seed
+        MATCH (s:Entity {{docId: $doc_id, name: seed}})
+        MATCH path = (s)-[:RELATION*1..{max_hops}]-(:Entity {{docId: $doc_id}})
+        UNWIND relationships(path) AS rel
+        WITH DISTINCT startNode(rel) AS a, rel, endNode(rel) AS b
+        RETURN a.name AS subject, rel.type AS relation, b.name AS object, rel.page AS page
+        LIMIT $max_triplets
+    """
+    with driver.session(database=neo4j_database()) as session:
+        result = session.run(query, doc_id=doc_id, seeds=seed_nodes, max_triplets=max_triplets)
+        return [
+            Triplet(subject=r["subject"], relation=r["relation"] or "related_to", object=r["object"], page=r["page"])
+            for r in result
+        ]
+
+
+def _neo4j_keyword_fallback_triplets(doc_id: str, question: str, max_triplets: int) -> list[Triplet]:
+    """Cypher equivalent of _keyword_fallback_triplets."""
+    keywords = [
+        w for w in re.findall(r"[a-zA-Z0-9]+", question.lower()) if len(w) >= MIN_FALLBACK_KEYWORD_LEN
+    ]
+    if not keywords:
+        return []
+
+    driver = get_neo4j_driver()
+    query = """
+        MATCH (a:Entity {docId: $doc_id})-[r:RELATION]->(b:Entity {docId: $doc_id})
+        WHERE any(kw IN $keywords WHERE
+            toLower(a.name) CONTAINS kw OR toLower(b.name) CONTAINS kw OR toLower(r.type) CONTAINS kw
+        )
+        RETURN DISTINCT a.name AS subject, r.type AS relation, b.name AS object, r.page AS page
+        LIMIT $max_triplets
+    """
+    with driver.session(database=neo4j_database()) as session:
+        result = session.run(query, doc_id=doc_id, keywords=keywords, max_triplets=max_triplets)
+        return [
+            Triplet(subject=r["subject"], relation=r["relation"] or "related_to", object=r["object"], page=r["page"])
+            for r in result
+        ]
+
+
 def _build_prompt(question: str, triplets: list[Triplet]) -> str:
     if not triplets:
         context = "(no relevant relationships found in the knowledge graph)"
@@ -256,17 +334,29 @@ def answer_question(
 ) -> GraphRAGResult:
     start = time.perf_counter()
 
-    graph = load_graph(doc_id)
     llm = get_llm(temperature=0)
-
     entities = _extract_query_entities(llm, question)
-    matched_nodes = _match_nodes(graph, entities)
-    triplets = _bfs_collect_triplets(graph, matched_nodes, max_hops, max_triplets) if matched_nodes else []
 
-    if not triplets:
-        triplets = _keyword_fallback_triplets(graph, question, max_triplets)
-        if triplets and not matched_nodes:
-            matched_nodes = sorted({t.subject for t in triplets} | {t.object for t in triplets})
+    if neo4j_enabled():
+        nodes = _neo4j_node_names(doc_id)
+        matched_nodes = _match_nodes(nodes, entities)
+        triplets = (
+            _neo4j_bfs_collect_triplets(doc_id, matched_nodes, max_hops, max_triplets)
+            if matched_nodes
+            else []
+        )
+        if not triplets:
+            triplets = _neo4j_keyword_fallback_triplets(doc_id, question, max_triplets)
+            if triplets and not matched_nodes:
+                matched_nodes = sorted({t.subject for t in triplets} | {t.object for t in triplets})
+    else:
+        graph = load_graph(doc_id)
+        matched_nodes = _match_nodes(list(graph.nodes), entities)
+        triplets = _bfs_collect_triplets(graph, matched_nodes, max_hops, max_triplets) if matched_nodes else []
+        if not triplets:
+            triplets = _keyword_fallback_triplets(graph, question, max_triplets)
+            if triplets and not matched_nodes:
+                matched_nodes = sorted({t.subject for t in triplets} | {t.object for t in triplets})
 
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
